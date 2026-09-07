@@ -13,7 +13,7 @@ from openai import AsyncOpenAI
 _client: AsyncOpenAI | None = None
 
 
-GROQ_MODEL = "llama-3.1-8b-instant"
+GROQ_MODEL = "openai/gpt-oss-120b"
 
 
 def client() -> AsyncOpenAI:
