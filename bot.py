@@ -113,6 +113,8 @@ async def role_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await db.set_account_type(context.user_data["db_user_id"], "merchant")
         existing = await db.get_business_by_user(context.user_data["db_user_id"])
         if existing:
+            # حفظ رقم النشاط ضروري عند إنشاء حملة في جلسة لاحقة.
+            context.user_data["business_id"] = existing["id"]
             return await show_merchant_menu(query, context)
         await query.edit_message_text("لنسجّل نشاطك التجاري.\n\nما اسم النشاط؟")
         return MER_BIZ_NAME
@@ -308,13 +310,23 @@ async def campaign_confirm_router(update: Update, context: ContextTypes.DEFAULT_
         return await show_merchant_menu(query, context)
 
     data = pending["ai_data"]
+    business_id = context.user_data.get("business_id")
+    if not business_id:
+        business = await db.get_business_by_user(context.user_data["db_user_id"])
+        if business:
+            business_id = business["id"]
+            context.user_data["business_id"] = business_id
+    if not business_id:
+        await query.edit_message_text("لا يوجد نشاط تجاري مسجل. أعد تسجيل نشاطك من /start.")
+        return ConversationHandler.END
+
     category_row = await db.pool().fetchrow(
         "SELECT id FROM categories WHERE code=$1", data.get("category_code")
     )
     city_row = await db.pool().fetchrow("SELECT id FROM cities WHERE code=$1", data.get("city_code"))
 
     campaign = await db.create_campaign(
-        business_id=context.user_data["business_id"],
+        business_id=business_id,
         raw_input=pending["raw"],
         ai_data=data,
         ad_text=pending["ad_text"],
