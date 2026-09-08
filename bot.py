@@ -750,8 +750,8 @@ def build_application() -> Application:
 
     # استلام كود الخصم من رسالة الحملة المُرسلة للعميل
     application.add_handler(CallbackQueryHandler(admin_pending_callback, pattern="^admin_pending$"))
-    application.add_handler(CallbackQueryHandler(admin_campaign_action, pattern="^admin_(approve|reject)_\d+$"))
-    application.add_handler(CallbackQueryHandler(admin_send_callback, pattern="^admin_send_\d+$"))
+    application.add_handler(CallbackQueryHandler(admin_campaign_action, pattern=r"^admin_(approve|reject)_\d+$"))
+    application.add_handler(CallbackQueryHandler(admin_send_callback, pattern=r"^admin_send_\d+$"))
     application.add_handler(CallbackQueryHandler(get_discount_code, pattern="^getcode_"))
     application.add_error_handler(on_error)
 
