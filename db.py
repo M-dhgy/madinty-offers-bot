@@ -225,6 +225,27 @@ async def redeem_code(code: str):
     return row
 
 
+async def redeem_code_for_business(code: str, business_id: int):
+    """تفعيل الكود فقط إذا كان تابعًا لحملة النشاط وغير مستخدم سابقًا."""
+    async with pool().acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """UPDATE discount_codes dc SET status='redeemed', redeemed_at=now()
+                   FROM campaigns c
+                   WHERE dc.campaign_id=c.id AND c.business_id=$1
+                     AND dc.code=$2 AND dc.status='unused'
+                   RETURNING dc.*""",
+                business_id, code,
+            )
+            if row:
+                await conn.execute(
+                    "INSERT INTO campaign_events (campaign_id, user_id, event_type) "
+                    "VALUES ($1, $2, 'REDEEMED')",
+                    row["campaign_id"], row["user_id"],
+                )
+            return row
+
+
 async def log_event(campaign_id: int, user_id: int | None, event_type: str):
     await pool().execute(
         "INSERT INTO campaign_events (campaign_id, user_id, event_type) VALUES ($1, $2, $3)",

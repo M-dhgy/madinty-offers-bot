@@ -57,6 +57,7 @@ BATCH_DELAY_SECONDS = float(os.environ.get("BROADCAST_BATCH_DELAY", "1.5"))
     CAMPAIGN_DESC,
     CAMPAIGN_CONFIRM,
 ) = range(10)
+REDEEM_CODE = 10
 
 BIZ_TYPES = ["مطعم / كافيه", "متجر", "مركز تجميل", "خدمات"]
 
@@ -382,10 +383,11 @@ async def show_merchant_menu(update_or_query, context: ContextTypes.DEFAULT_TYPE
     keyboard = [
         [InlineKeyboardButton("➕ إنشاء حملة", callback_data="new_campaign")],
         [InlineKeyboardButton("📊 حالة حملاتي", callback_data="my_campaigns")],
+        [InlineKeyboardButton("🎟️ تحقق من كود خصم", callback_data="redeem_menu")],
     ]
     text = "لوحة التاجر — ماذا تريد أن تفعل؟"
     reply_keyboard = ReplyKeyboardMarkup(
-        [["➕ إنشاء حملة", "📊 حالة حملاتي"], ["🏠 القائمة الرئيسية"]],
+        [["➕ إنشاء حملة", "📊 حالة حملاتي"], ["🎟️ تحقق من كود خصم"], ["🏠 القائمة الرئيسية"]],
         resize_keyboard=True,
         is_persistent=True,
     )
@@ -408,6 +410,10 @@ async def merchant_menu_router(update: Update, context: ContextTypes.DEFAULT_TYP
             "من الخميس للسبت، والمطعم في الخرطوم بحري)."
         )
         return CAMPAIGN_DESC
+
+    if query.data == "redeem_menu":
+        await query.edit_message_text("🎟️ أرسل كود الخصم الذي قدمه لك العميل للتحقق منه:")
+        return REDEEM_CODE
 
     if query.data == "my_campaigns":
         biz = await db.get_business_by_user(context.user_data["db_user_id"])
@@ -453,6 +459,26 @@ async def merchant_text_menu_router(update: Update, context: ContextTypes.DEFAUL
         return MER_MENU
     if text == "🏠 القائمة الرئيسية":
         return await start(update, context)
+    return MER_MENU
+
+
+async def merchant_redeem_code_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = await db.get_user_by_telegram_id(update.effective_user.id)
+    business = await db.get_business_by_user(user["id"]) if user else None
+    if not business:
+        await update.message.reply_text("لا يوجد نشاط تجاري مسجل لهذا الحساب.")
+        return MER_MENU
+    code = (update.message.text or "").strip().upper()
+    row = await db.redeem_code_for_business(code, business["id"])
+    if row:
+        await update.message.reply_text(
+            f"✅ الكود {row['code']} صالح وتم تسجيل استخدامه بنجاح.\n"
+            "يُرجى تطبيق الخصم للعميل حسب تفاصيل الحملة."
+        )
+    else:
+        await update.message.reply_text(
+            "❌ الكود غير صالح، أو تابع لنشاط آخر، أو تم استخدامه مسبقًا."
+        )
     return MER_MENU
 
 
@@ -694,7 +720,12 @@ async def cmd_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ))):
         await update.message.reply_text("هذا الأمر مخصص للإدارة وأصحاب الأنشطة المسجلة.")
         return
-    row = await db.redeem_code(parts[1].upper())
+    if is_admin(update):
+        row = await db.redeem_code(parts[1].upper())
+    else:
+        user = await db.get_user_by_telegram_id(update.effective_user.id)
+        business = await db.get_business_by_user(user["id"]) if user else None
+        row = await db.redeem_code_for_business(parts[1].upper(), business["id"]) if business else None
     if row:
         await update.message.reply_text(f"✅ تم استخدام الكود {row['code']} بنجاح.")
     else:
@@ -748,6 +779,7 @@ def build_application() -> Application:
                 CallbackQueryHandler(merchant_menu_router),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, merchant_text_menu_router),
             ],
+            REDEEM_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, merchant_redeem_code_received)],
             CAMPAIGN_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, campaign_description_received)],
             CAMPAIGN_CONFIRM: [CallbackQueryHandler(campaign_confirm_router)],
         },
