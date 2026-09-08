@@ -79,6 +79,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("ℹ️ كيف يعمل؟", callback_data="how_it_works")],
         [InlineKeyboardButton("📞 تواصل معنا", callback_data="contact_us")],
     ]
+    if is_admin(update):
+        keyboard.append([InlineKeyboardButton("🛠 لوحة الإدارة", callback_data="admin_menu")])
     await update.message.reply_text(
         "أهلاً بك في *عروض مدينتي* 👋\n\nاختر نوع حسابك:",
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -125,6 +127,13 @@ async def role_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
+    if query.data == "admin_menu":
+        if not is_admin(update):
+            await query.edit_message_text("غير مصرح لك باستخدام لوحة الإدارة.")
+            return SELECT_ROLE
+        await show_admin_menu(query)
+        return SELECT_ROLE
+
     if query.data == "how_it_works":
         await query.edit_message_text(
             "📌 تختار مدينتك واهتماماتك، ونرسل لك عروضاً من تجار موثوقين في مدينتك فقط.\n"
@@ -154,6 +163,105 @@ async def role_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return MER_BIZ_NAME
 
     return SELECT_ROLE
+
+
+async def show_admin_menu(query):
+    await query.edit_message_text(
+        "🛠 لوحة الإدارة\n\nاختر الإجراء المطلوب:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 حملات بانتظار المراجعة", callback_data="admin_pending")],
+            [InlineKeyboardButton("🔄 تحديث القائمة", callback_data="admin_menu")],
+        ]),
+    )
+
+
+async def admin_pending_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        await query.edit_message_text("غير مصرح لك باستخدام لوحة الإدارة.")
+        return
+    rows = await db.list_pending_campaigns()
+    if not rows:
+        await query.edit_message_text(
+            "✅ لا توجد حملات بانتظار المراجعة.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 لوحة الإدارة", callback_data="admin_menu")]]),
+        )
+        return
+    for row in rows:
+        await query.message.reply_text(
+            f"🆕 الحملة #{row['id']}\nالنشاط: {row['business_name']}\n\n{row['description']}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ اعتماد", callback_data=f"admin_approve_{row['id']}"),
+                InlineKeyboardButton("❌ رفض", callback_data=f"admin_reject_{row['id']}"),
+            ]]),
+        )
+    await query.edit_message_text(
+        "اختر اعتماد أو رفض كل حملة من الرسائل أعلاه.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 لوحة الإدارة", callback_data="admin_menu")]]),
+    )
+
+
+async def admin_campaign_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        await query.edit_message_text("غير مصرح لك باستخدام لوحة الإدارة.")
+        return
+    try:
+        _, action, campaign_id_text = query.data.split("_")
+        campaign_id = int(campaign_id_text)
+    except (ValueError, IndexError):
+        await query.edit_message_text("تعذر قراءة الحملة.")
+        return
+    campaign = await db.get_campaign(campaign_id)
+    if not campaign or campaign["status"] != "pending_review":
+        await query.edit_message_text("هذه الحملة لم تعد بانتظار المراجعة.")
+        return
+    if action == "approve":
+        await db.set_campaign_status(campaign_id, "approved")
+        await query.edit_message_text(
+            f"✅ تم اعتماد الحملة #{campaign_id}.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📣 نشر الحملة", callback_data=f"admin_send_{campaign_id}")]]),
+        )
+    else:
+        await db.set_campaign_status(campaign_id, "rejected")
+        await query.edit_message_text(f"❌ تم رفض الحملة #{campaign_id}.")
+
+
+async def admin_send_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("بدأ النشر...")
+    if not is_admin(update):
+        await query.edit_message_text("غير مصرح لك باستخدام لوحة الإدارة.")
+        return
+    try:
+        campaign_id = int(query.data.rsplit("_", 1)[1])
+    except (ValueError, IndexError):
+        await query.edit_message_text("تعذر قراءة الحملة.")
+        return
+    campaign = await db.get_campaign(campaign_id)
+    if not campaign or campaign["status"] != "approved":
+        await query.edit_message_text("الحملة غير موجودة أو غير معتمدة.")
+        return
+    targets = await db.find_target_users(campaign["city_id"], campaign["category_id"])
+    sent = 0
+    for i in range(0, len(targets), BATCH_SIZE):
+        for user in targets[i:i + BATCH_SIZE]:
+            try:
+                await context.bot.send_message(
+                    user["telegram_id"], campaign["description"],
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🎁 احصل على كود الخصم", callback_data=f"getcode_{campaign_id}")
+                    ]]),
+                )
+                await db.log_event(campaign_id, user["id"], "SENT")
+                sent += 1
+            except Exception as exc:  # noqa: BLE001
+                log.warning("فشل إرسال الحملة %s إلى %s: %s", campaign_id, user["telegram_id"], exc)
+        await asyncio.sleep(BATCH_DELAY_SECONDS)
+    await db.mark_campaign_published(campaign_id)
+    await query.edit_message_text(f"✅ تم نشر الحملة #{campaign_id} وإرسالها إلى {sent} مستخدم.")
 
 
 # =================================================================
@@ -641,6 +749,9 @@ def build_application() -> Application:
     application.add_handler(MessageHandler(filters.Regex(r"^/send_\d+$"), cmd_send_campaign))
 
     # استلام كود الخصم من رسالة الحملة المُرسلة للعميل
+    application.add_handler(CallbackQueryHandler(admin_pending_callback, pattern="^admin_pending$"))
+    application.add_handler(CallbackQueryHandler(admin_campaign_action, pattern="^admin_(approve|reject)_\d+$"))
+    application.add_handler(CallbackQueryHandler(admin_send_callback, pattern="^admin_send_\d+$"))
     application.add_handler(CallbackQueryHandler(get_discount_code, pattern="^getcode_"))
     application.add_error_handler(on_error)
 
