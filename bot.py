@@ -19,7 +19,7 @@ import logging
 import os
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -84,6 +84,40 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode=ParseMode.MARKDOWN,
     )
+    await update.message.reply_text(
+        "يمكنك أيضًا استخدام القائمة العربية أسفل الشاشة للتنقل بسهولة.",
+        reply_markup=ReplyKeyboardMarkup(
+            [["🔎 أبحث عن عروض", "🏪 صاحب نشاط تجاري"], ["ℹ️ كيف يعمل؟", "📞 تواصل معنا"]],
+            resize_keyboard=True,
+            is_persistent=True,
+        ),
+    )
+    return SELECT_ROLE
+
+
+async def text_role_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """يعالج اختيارات القائمة النصية بدل إجبار المستخدم على كتابة أوامر."""
+    text = (update.message.text or "").strip()
+    if text == "🔎 أبحث عن عروض":
+        await db.set_account_type(context.user_data["db_user_id"], "customer")
+        cities = await db.list_cities()
+        keyboard = [[InlineKeyboardButton(c["name"], callback_data=f"city_{c['id']}")] for c in cities]
+        await update.message.reply_text("اختر مدينتك:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return CUST_CITY
+    if text == "🏪 صاحب نشاط تجاري":
+        await db.set_account_type(context.user_data["db_user_id"], "merchant")
+        existing = await db.get_business_by_user(context.user_data["db_user_id"])
+        if existing:
+            context.user_data["business_id"] = existing["id"]
+            return await show_merchant_menu(update, context)
+        await update.message.reply_text("لنسجّل نشاطك التجاري.\n\nما اسم النشاط؟")
+        return MER_BIZ_NAME
+    if text == "ℹ️ كيف يعمل؟":
+        await update.message.reply_text("📌 اختر مدينتك واهتماماتك، وسنرسل لك عروضًا مناسبة من تجار مدينتك.")
+        return SELECT_ROLE
+    if text == "📞 تواصل معنا":
+        await update.message.reply_text("للتواصل: @madinty_support")
+        return SELECT_ROLE
     return SELECT_ROLE
 
 
@@ -225,11 +259,17 @@ async def show_merchant_menu(update_or_query, context: ContextTypes.DEFAULT_TYPE
         [InlineKeyboardButton("📊 حالة حملاتي", callback_data="my_campaigns")],
     ]
     text = "لوحة التاجر — ماذا تريد أن تفعل؟"
+    reply_keyboard = ReplyKeyboardMarkup(
+        [["➕ إنشاء حملة", "📊 حالة حملاتي"], ["🏠 القائمة الرئيسية"]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
     if hasattr(update_or_query, "message") and update_or_query.message is None:
         await update_or_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await update_or_query.message.reply_text("استخدم القائمة أسفل الشاشة للتعامل مع البوت.", reply_markup=reply_keyboard)
     else:
         target = update_or_query.message if hasattr(update_or_query, "message") else update_or_query
-        await target.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await target.reply_text(text, reply_markup=reply_keyboard)
     return MER_MENU
 
 
@@ -260,6 +300,34 @@ async def merchant_menu_router(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.edit_message_text("حملاتك:\n" + "\n".join(lines))
         return MER_MENU
 
+    return MER_MENU
+
+
+async def merchant_text_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """نفس خيارات لوحة التاجر لكن من لوحة المفاتيح العربية."""
+    text = (update.message.text or "").strip()
+    if text == "➕ إنشاء حملة":
+        await update.message.reply_text(
+            "✍️ اكتب وصفاً حراً للعرض (مثال: خصم 30% على الوجبات البحرية من الخميس للسبت)."
+        )
+        return CAMPAIGN_DESC
+    if text == "📊 حالة حملاتي":
+        biz = await db.get_business_by_user(context.user_data["db_user_id"])
+        if not biz:
+            await update.message.reply_text("لا يوجد نشاط مسجل بعد.")
+            return MER_MENU
+        rows = await db.pool().fetch(
+            "SELECT id, title, status FROM campaigns WHERE business_id=$1 ORDER BY id DESC LIMIT 10",
+            biz["id"],
+        )
+        if not rows:
+            await update.message.reply_text("لا توجد حملات بعد.")
+        else:
+            lines = [f"#{r['id']} — {r['title']} — {r['status']}" for r in rows]
+            await update.message.reply_text("حملاتك:\n" + "\n".join(lines))
+        return MER_MENU
+    if text == "🏠 القائمة الرئيسية":
+        return await start(update, context)
     return MER_MENU
 
 
@@ -541,14 +609,20 @@ def build_application() -> Application:
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            SELECT_ROLE: [CallbackQueryHandler(role_router)],
+            SELECT_ROLE: [
+                CallbackQueryHandler(role_router),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, text_role_router),
+            ],
             CUST_CITY: [CallbackQueryHandler(customer_city_chosen, pattern="^city_")],
             CUST_CATEGORIES: [CallbackQueryHandler(customer_category_toggle, pattern="^cat_")],
             MER_BIZ_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, merchant_biz_name)],
             MER_BIZ_TYPE: [CallbackQueryHandler(merchant_biz_type, pattern="^biztype_")],
             MER_BIZ_CITY: [CallbackQueryHandler(merchant_biz_city, pattern="^bizcity_")],
             MER_BIZ_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, merchant_biz_phone)],
-            MER_MENU: [CallbackQueryHandler(merchant_menu_router)],
+            MER_MENU: [
+                CallbackQueryHandler(merchant_menu_router),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, merchant_text_menu_router),
+            ],
             CAMPAIGN_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, campaign_description_received)],
             CAMPAIGN_CONFIRM: [CallbackQueryHandler(campaign_confirm_router)],
         },
