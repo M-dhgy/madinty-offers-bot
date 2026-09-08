@@ -323,6 +323,13 @@ async def customer_category_toggle(update: Update, context: ContextTypes.DEFAULT
             await query.message.reply_text(
                 "لا توجد عروض مطابقة حاليًا، وسنرسل لك أي عرض جديد يناسب مدينتك واهتماماتك."
             )
+        await query.message.reply_text(
+            "📍 يمكنك الآن تصفح دليل مدينتك أو سوق الأفراد:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🏪 دليل الأنشطة", callback_data="customer_directory")],
+                [InlineKeyboardButton("🛒 سوق الأفراد", callback_data="customer_market")],
+            ]),
+        )
         return ConversationHandler.END
 
     cat_id = int(query.data.split("_")[1])
@@ -758,6 +765,43 @@ async def get_discount_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def customer_directory_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = await db.get_user_by_telegram_id(update.effective_user.id)
+    businesses = await db.list_public_businesses(user["city_id"] if user else None)
+    if not businesses:
+        await query.edit_message_text("لا توجد أنشطة مسجلة في مدينتك حاليًا.")
+        return
+    await query.edit_message_text("🏪 دليل الأنشطة في مدينتك:")
+    for business in businesses:
+        await query.message.reply_text(
+            f"🏪 {business['business_name']}\n"
+            f"التصنيف: {business['business_type'] or 'خدمات'}\n"
+            f"المدينة: {business['city_name'] or 'غير محددة'}\n"
+            f"📞 {business['phone'] or 'لا يوجد رقم مسجل'}"
+        )
+
+
+async def customer_market_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = await db.get_user_by_telegram_id(update.effective_user.id)
+    listings = await db.list_public_listings(user["city_id"] if user else None)
+    if not listings:
+        await query.edit_message_text(
+            "🛒 سوق الأفراد جاهز لاستقبال الإعلانات، ولا توجد أغراض منشورة في مدينتك حاليًا."
+        )
+        return
+    await query.edit_message_text("🛒 أحدث الأغراض المعروضة في مدينتك:")
+    for listing in listings:
+        price = str(listing["price"]) if listing["price"] is not None else "السعر عند التواصل"
+        await query.message.reply_text(
+            f"📦 {listing['title']}\nالسعر: {price}\n"
+            f"الحالة: {listing['condition'] or 'غير محددة'}\n\n{listing['description'] or ''}"
+        )
+
+
 async def cmd_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """يستخدمها التاجر/الموظف: /redeem KHART-8F21"""
     parts = update.message.text.split()
@@ -864,6 +908,8 @@ def build_application() -> Application:
     application.add_handler(CallbackQueryHandler(get_discount_code, pattern="^getcode_"))
     application.add_handler(CallbackQueryHandler(merchant_redeem_prompt_fallback, pattern="^redeem_menu$"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, merchant_redeem_fallback_message))
+    application.add_handler(CallbackQueryHandler(customer_directory_callback, pattern="^customer_directory$"))
+    application.add_handler(CallbackQueryHandler(customer_market_callback, pattern="^customer_market$"))
     application.add_error_handler(on_error)
 
     return application

@@ -15,6 +15,23 @@ async def init_pool():
     global _pool
     dsn = os.environ["DATABASE_URL"]  # e.g. postgresql://user:pass@localhost:5432/madinty
     _pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=10)
+    # ترقية آمنة لقاعدة البيانات الحالية دون حذف أي بيانات.
+    await _pool.execute("""
+        CREATE TABLE IF NOT EXISTS listings (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            description TEXT,
+            price NUMERIC(12,2),
+            condition TEXT,
+            city_id INTEGER REFERENCES cities(id),
+            category TEXT,
+            status TEXT NOT NULL DEFAULT 'pending_review',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE INDEX IF NOT EXISTS idx_listings_search ON listings(status, city_id, created_at DESC);
+    """)
     return _pool
 
 
@@ -38,6 +55,51 @@ async def list_cities():
 
 async def list_categories():
     return await pool().fetch("SELECT id, name, code FROM categories WHERE status='active' ORDER BY id")
+
+
+async def list_public_businesses(city_id: int | None = None, business_type: str | None = None):
+    query = """SELECT b.*, c.name AS city_name FROM businesses b
+               LEFT JOIN cities c ON c.id=b.city_id
+               WHERE b.status IN ('pending', 'approved')"""
+    args = []
+    if city_id:
+        args.append(city_id)
+        query += f" AND b.city_id=${len(args)}"
+    if business_type:
+        args.append(business_type)
+        query += f" AND b.business_type=${len(args)}"
+    query += " ORDER BY b.status='approved' DESC, b.id DESC LIMIT 30"
+    return await pool().fetch(query, *args)
+
+
+async def create_listing(user_id: int, title: str, description: str, price: str | None,
+                         condition: str, city_id: int | None, category: str):
+    parsed_price = None
+    if price:
+        try:
+            parsed_price = float(price.replace(",", ".").strip())
+        except ValueError:
+            parsed_price = None
+    return await pool().fetchrow(
+        """INSERT INTO listings (user_id, title, description, price, condition, city_id, category)
+           VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *""",
+        user_id, title, description, parsed_price, condition, city_id, category,
+    )
+
+
+async def list_public_listings(city_id: int | None = None, category: str | None = None):
+    query = """SELECT l.*, c.name AS city_name FROM listings l
+               LEFT JOIN cities c ON c.id=l.city_id
+               WHERE l.status='approved'"""
+    args = []
+    if city_id:
+        args.append(city_id)
+        query += f" AND l.city_id=${len(args)}"
+    if category:
+        args.append(category)
+        query += f" AND l.category=${len(args)}"
+    query += " ORDER BY l.created_at DESC LIMIT 30"
+    return await pool().fetch(query, *args)
 
 
 # ---------------------------------------------------------------

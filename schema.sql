@@ -88,9 +88,25 @@ CREATE TABLE IF NOT EXISTS campaign_events (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- سوق الأفراد: الإعلانات تمر بالمراجعة قبل ظهورها للعامة
+CREATE TABLE IF NOT EXISTS listings (
+    id           SERIAL PRIMARY KEY,
+    user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title        TEXT NOT NULL,
+    description  TEXT,
+    price        NUMERIC(12,2),
+    condition    TEXT,
+    city_id      INTEGER REFERENCES cities(id),
+    category     TEXT,
+    status       TEXT NOT NULL DEFAULT 'pending_review',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE INDEX IF NOT EXISTS idx_users_city ON users(city_id);
 CREATE INDEX IF NOT EXISTS idx_campaigns_status ON campaigns(status);
 CREATE INDEX IF NOT EXISTS idx_events_campaign ON campaign_events(campaign_id);
+CREATE INDEX IF NOT EXISTS idx_listings_search ON listings(status, city_id, created_at DESC);
 
 -- ============================================================
 -- Seed data
