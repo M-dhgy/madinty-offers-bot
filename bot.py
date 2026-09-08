@@ -469,7 +469,12 @@ async def merchant_redeem_code_received(update: Update, context: ContextTypes.DE
         await update.message.reply_text("لا يوجد نشاط تجاري مسجل لهذا الحساب.")
         return MER_MENU
     code = (update.message.text or "").strip().upper()
-    row = await db.redeem_code_for_business(code, business["id"])
+    try:
+        row = await db.redeem_code_for_business(code, business["id"])
+    except Exception as exc:  # noqa: BLE001
+        log.exception("فشل التحقق من كود الخصم %s: %s", code, exc)
+        await update.message.reply_text("تعذر التحقق من الكود مؤقتًا. حاول مرة أخرى بعد قليل.")
+        return MER_MENU
     if row:
         await update.message.reply_text(
             f"✅ الكود {row['code']} صالح وتم تسجيل استخدامه بنجاح.\n"
@@ -480,6 +485,39 @@ async def merchant_redeem_code_received(update: Update, context: ContextTypes.DE
             "❌ الكود غير صالح، أو تابع لنشاط آخر، أو تم استخدامه مسبقًا."
         )
     return MER_MENU
+
+
+async def merchant_redeem_prompt_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """مسار احتياطي إذا ضغط التاجر الزر بعد انتهاء حالة المحادثة."""
+    query = update.callback_query
+    await query.answer()
+    user = await db.get_user_by_telegram_id(update.effective_user.id)
+    business = await db.get_business_by_user(user["id"]) if user else None
+    if not business:
+        await query.edit_message_text("لا يوجد نشاط تجاري مسجل لهذا الحساب.")
+        return
+    await query.edit_message_text("🎟️ أرسل كود الخصم الذي قدمه لك العميل للتحقق منه:")
+    context.user_data["awaiting_redeem_code"] = True
+
+
+async def merchant_redeem_fallback_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.pop("awaiting_redeem_code", False):
+        return
+    user = await db.get_user_by_telegram_id(update.effective_user.id)
+    business = await db.get_business_by_user(user["id"]) if user else None
+    if not business:
+        await update.message.reply_text("لا يوجد نشاط تجاري مسجل لهذا الحساب.")
+        return
+    try:
+        row = await db.redeem_code_for_business(update.message.text.strip().upper(), business["id"])
+    except Exception:  # noqa: BLE001
+        log.exception("فشل مسار التحقق الاحتياطي من كود الخصم")
+        await update.message.reply_text("تعذر التحقق من الكود مؤقتًا. حاول مرة أخرى بعد قليل.")
+        return
+    await update.message.reply_text(
+        "✅ الكود صالح وتم تسجيل استخدامه بنجاح."
+        if row else "❌ الكود غير صالح أو مستخدم مسبقًا أو تابع لنشاط آخر."
+    )
 
 
 # =================================================================
@@ -802,6 +840,8 @@ def build_application() -> Application:
     application.add_handler(CallbackQueryHandler(admin_campaign_action, pattern=r"^admin_(approve|reject)_\d+$"))
     application.add_handler(CallbackQueryHandler(admin_send_callback, pattern=r"^admin_send_\d+$"))
     application.add_handler(CallbackQueryHandler(get_discount_code, pattern="^getcode_"))
+    application.add_handler(CallbackQueryHandler(merchant_redeem_prompt_fallback, pattern="^redeem_menu$"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, merchant_redeem_fallback_message))
     application.add_error_handler(on_error)
 
     return application
