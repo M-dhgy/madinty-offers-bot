@@ -40,7 +40,7 @@ cp .env.example .env
 # ثم عدّل .env بالقيم الحقيقية:
 # - TELEGRAM_BOT_TOKEN من @BotFather
 # - DATABASE_URL برابط قاعدة بياناتك
-# - OPENAI_API_KEY من platform.openai.com
+# - GROQ_API_KEY من console.groq.com
 # - ADMIN_TELEGRAM_IDS: معرّفك في تيليجرام (احصل عليه من @userinfobot)
 ```
 
@@ -48,6 +48,12 @@ cp .env.example .env
 ```bash
 python bot.py
 ```
+
+إذا كان المشروع مربوطًا بـ Railway، ضع هذه القيم في تبويب **Variables** داخل خدمة
+البوت، ولا تضعها داخل GitHub أو داخل الكود. بعد حفظ المتغيرات أعد النشر من Railway.
+
+المتغيرات الاختيارية هي `GROQ_MODEL` و`GROQ_BASE_URL` و`AI_TIMEOUT_SECONDS` و
+`BROADCAST_BATCH_SIZE` و`BROADCAST_BATCH_DELAY`.
 
 ## تدفق الاستخدام
 

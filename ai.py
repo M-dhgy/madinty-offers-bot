@@ -13,7 +13,7 @@ from openai import AsyncOpenAI
 _client: AsyncOpenAI | None = None
 
 
-GROQ_MODEL = "openai/gpt-oss-120b"
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 
 
 def client() -> AsyncOpenAI:
@@ -22,7 +22,9 @@ def client() -> AsyncOpenAI:
         # Groq يوفّر واجهة متوافقة مع OpenAI مجاناً بدون بطاقة دفع
         _client = AsyncOpenAI(
             api_key=os.environ["GROQ_API_KEY"],
-            base_url="https://api.groq.com/openai/v1",
+            base_url=os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1"),
+            timeout=float(os.environ.get("AI_TIMEOUT_SECONDS", "45")),
+            max_retries=2,
         )
     return _client
 
@@ -53,28 +55,36 @@ AD_COPY_SYSTEM_PROMPT = """
 
 
 async def extract_campaign_data(raw_text: str) -> dict:
-    resp = await client().chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-            {"role": "user", "content": raw_text},
-        ],
-        temperature=0.2,
-        response_format={"type": "json_object"},
-    )
     try:
-        return json.loads(resp.choices[0].message.content)
-    except (json.JSONDecodeError, IndexError):
+        resp = await client().chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+                {"role": "user", "content": raw_text},
+            ],
+            temperature=0.2,
+            response_format={"type": "json_object"},
+        )
+        content = resp.choices[0].message.content or ""
+        data = json.loads(content)
+        return data if isinstance(data, dict) else {"issues": ["استجابة الذكاء الاصطناعي غير صالحة."]}
+    except (json.JSONDecodeError, IndexError, TypeError, ValueError) as exc:
+        return {"issues": ["تعذر تحليل النص، الرجاء إعادة الصياغة بشكل أوضح."], "error": str(exc)}
+    except Exception:
         return {"issues": ["تعذر تحليل النص، الرجاء إعادة الصياغة بشكل أوضح."]}
 
 
 async def generate_ad_copy(data: dict) -> str:
-    resp = await client().chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {"role": "system", "content": AD_COPY_SYSTEM_PROMPT},
-            {"role": "user", "content": json.dumps(data, ensure_ascii=False)},
-        ],
-        temperature=0.7,
-    )
-    return resp.choices[0].message.content.strip()
+    try:
+        resp = await client().chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": AD_COPY_SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps(data, ensure_ascii=False)},
+            ],
+            temperature=0.7,
+        )
+        content = (resp.choices[0].message.content or "").strip()
+        return content or "تعذر إنشاء نص الإعلان. الرجاء المحاولة مرة أخرى."
+    except Exception:
+        return "تعذر إنشاء نص الإعلان مؤقتاً. الرجاء المحاولة مرة أخرى."

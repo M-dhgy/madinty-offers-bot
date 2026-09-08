@@ -384,7 +384,11 @@ async def cmd_send_campaign(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     cmd = update.message.text.lstrip("/")
     _, _, campaign_id_str = cmd.partition("_")
-    campaign_id = int(campaign_id_str)
+    try:
+        campaign_id = int(campaign_id_str)
+    except ValueError:
+        await update.message.reply_text("صيغة غير صحيحة. استخدم /send_123")
+        return
 
     campaign = await db.get_campaign(campaign_id)
     if not campaign or campaign["status"] != "approved":
@@ -423,7 +427,11 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(parts) != 2:
         await update.message.reply_text("الاستخدام: /report <رقم الحملة>")
         return
-    campaign_id = int(parts[1])
+    try:
+        campaign_id = int(parts[1])
+    except ValueError:
+        await update.message.reply_text("رقم الحملة يجب أن يكون رقمًا صحيحًا.")
+        return
     stats = await db.campaign_report(campaign_id)
     sent = stats["sent"] or 1
     conv_rate = round((stats["redeemed"] / sent) * 100, 1)
@@ -443,7 +451,11 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def get_discount_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    campaign_id = int(query.data.split("_")[1])
+    try:
+        campaign_id = int(query.data.split("_")[1])
+    except (IndexError, ValueError):
+        await query.answer("تعذر قراءة الحملة.", show_alert=True)
+        return
 
     user_row = await db.get_user_by_telegram_id(update.effective_user.id)
     if not user_row:
@@ -451,6 +463,9 @@ async def get_discount_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     campaign = await db.get_campaign(campaign_id)
+    if not campaign or campaign["status"] != "active":
+        await query.answer("هذا العرض غير متاح حاليًا.", show_alert=True)
+        return
     city_row = await db.pool().fetchrow("SELECT code FROM cities WHERE id=$1", campaign["city_id"])
     city_code = city_row["code"] if city_row else "OFFER"
 
@@ -468,6 +483,11 @@ async def cmd_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = update.message.text.split()
     if len(parts) != 2:
         await update.message.reply_text("الاستخدام: /redeem <الكود>")
+        return
+    if not (is_admin(update) or (update.effective_user and await db.get_business_by_user(
+        (await db.get_user_by_telegram_id(update.effective_user.id)) or {"id": None}
+    ))):
+        await update.message.reply_text("هذا الأمر مخصص للإدارة وأصحاب الأنشطة المسجلة.")
         return
     row = await db.redeem_code(parts[1].upper())
     if row:
@@ -487,6 +507,15 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(application: Application):
     await db.init_pool()
     log.info("تم الاتصال بقاعدة البيانات.")
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("خطأ غير متوقع أثناء معالجة التحديث", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text("حدث خطأ مؤقت. حاول مرة أخرى بعد قليل.")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def post_shutdown(application: Application):
@@ -527,6 +556,7 @@ def build_application() -> Application:
 
     # استلام كود الخصم من رسالة الحملة المُرسلة للعميل
     application.add_handler(CallbackQueryHandler(get_discount_code, pattern="^getcode_"))
+    application.add_error_handler(on_error)
 
     return application
 

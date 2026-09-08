@@ -184,14 +184,20 @@ def _gen_code(city_code: str) -> str:
 
 
 async def create_discount_code(campaign_id: int, user_id: int, city_code: str):
-    code = _gen_code(city_code)
-    row = await pool().fetchrow(
-        """INSERT INTO discount_codes (campaign_id, user_id, code)
-           VALUES ($1, $2, $3) RETURNING *""",
-        campaign_id, user_id, code,
-    )
-    await log_event(campaign_id, user_id, "CODE_GENERATED")
-    return row
+    # إعادة المحاولة عند احتمال نادر لتصادم الكود الفريد.
+    for _ in range(5):
+        code = _gen_code(city_code)
+        try:
+            row = await pool().fetchrow(
+                """INSERT INTO discount_codes (campaign_id, user_id, code)
+                   VALUES ($1, $2, $3) RETURNING *""",
+                campaign_id, user_id, code,
+            )
+            await log_event(campaign_id, user_id, "CODE_GENERATED")
+            return row
+        except asyncpg.UniqueViolationError:
+            continue
+    raise RuntimeError("تعذر إنشاء كود خصم فريد بعد عدة محاولات")
 
 
 async def redeem_code(code: str):
