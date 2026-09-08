@@ -500,6 +500,17 @@ async def merchant_redeem_prompt_fallback(update: Update, context: ContextTypes.
     context.user_data["awaiting_redeem_code"] = True
 
 
+async def merchant_redeem_keyboard_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """يدخل التاجر إلى التحقق حتى لو لم تكن جلسة ConversationHandler فعالة."""
+    user = await db.get_user_by_telegram_id(update.effective_user.id)
+    business = await db.get_business_by_user(user["id"]) if user else None
+    if not business:
+        await update.message.reply_text("لا يوجد نشاط تجاري مسجل لهذا الحساب.")
+        return
+    context.user_data["awaiting_redeem_code"] = True
+    await update.message.reply_text("🎟️ أرسل كود الخصم الذي قدمه لك العميل للتحقق منه:")
+
+
 async def merchant_redeem_fallback_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.pop("awaiting_redeem_code", False):
         return
@@ -799,6 +810,17 @@ async def post_shutdown(application: Application):
 def build_application() -> Application:
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     application = Application.builder().token(token).post_init(post_init).post_shutdown(post_shutdown).build()
+
+    # هذه المعالجات تسبق المحادثة حتى يعمل زر التحقق بعد إعادة تشغيل البوت أيضًا.
+    application.add_handler(MessageHandler(
+        filters.Regex(r"^🎟️ تحقق من كود خصم$"), merchant_redeem_keyboard_entry
+    ), group=0)
+    application.add_handler(CallbackQueryHandler(
+        merchant_redeem_prompt_fallback, pattern=r"^redeem_menu$"
+    ), group=0)
+    application.add_handler(MessageHandler(
+        filters.Regex(r"^[A-Za-z]{2,10}-[A-Za-z0-9]{4,12}$"), merchant_redeem_fallback_message
+    ), group=0)
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
