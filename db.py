@@ -175,6 +175,20 @@ async def find_target_users(city_id: int | None, category_id: int | None):
     return await pool().fetch(query, *args)
 
 
+async def list_active_campaigns_for_user(user_id: int):
+    """الحملات النشطة المطابقة لمدينة العميل وفئة واحدة على الأقل من اهتماماته."""
+    return await pool().fetch(
+        """SELECT DISTINCT c.* FROM campaigns c
+           JOIN users u ON u.city_id = c.city_id
+           JOIN user_categories uc ON uc.category_id = c.category_id
+           WHERE c.status='active' AND u.id=$1
+             AND (c.start_date IS NULL OR c.start_date <= CURRENT_DATE)
+             AND (c.end_date IS NULL OR c.end_date >= CURRENT_DATE)
+           ORDER BY c.id DESC LIMIT 20""",
+        user_id,
+    )
+
+
 # ---------------------------------------------------------------
 # Discount codes & events
 # ---------------------------------------------------------------

@@ -303,8 +303,25 @@ async def customer_category_toggle(update: Update, context: ContextTypes.DEFAULT
             return CUST_CATEGORIES
         await db.set_user_categories(context.user_data["db_user_id"], list(selected))
         await query.edit_message_text(
-            "🎉 تم تسجيلك بنجاح! سنرسل لك عروضاً من مدينتك حسب اهتماماتك."
+            "🎉 تم تسجيل تفضيلاتك بنجاح!"
         )
+        campaigns = await db.list_active_campaigns_for_user(context.user_data["db_user_id"])
+        if campaigns:
+            await query.message.reply_text("🎁 هذه العروض المتاحة حاليًا حسب اختياراتك:")
+            for campaign in campaigns:
+                await query.message.reply_text(
+                    f"📢 {campaign['title']}\n\n{campaign['description']}",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton(
+                            "🎁 احصل على كود الخصم",
+                            callback_data=f"getcode_{campaign['id']}",
+                        )
+                    ]]),
+                )
+        else:
+            await query.message.reply_text(
+                "لا توجد عروض مطابقة حاليًا، وسنرسل لك أي عرض جديد يناسب مدينتك واهتماماتك."
+            )
         return ConversationHandler.END
 
     cat_id = int(query.data.split("_")[1])
