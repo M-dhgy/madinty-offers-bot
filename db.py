@@ -102,6 +102,26 @@ async def list_public_listings(city_id: int | None = None, category: str | None 
     return await pool().fetch(query, *args)
 
 
+async def list_pending_listings():
+    return await pool().fetch(
+        """SELECT l.*, u.telegram_id, u.first_name, c.name AS city_name
+           FROM listings l JOIN users u ON u.id=l.user_id
+           LEFT JOIN cities c ON c.id=l.city_id
+           WHERE l.status='pending_review' ORDER BY l.id"""
+    )
+
+
+async def get_listing(listing_id: int):
+    return await pool().fetchrow("SELECT * FROM listings WHERE id=$1", listing_id)
+
+
+async def set_listing_status(listing_id: int, status: str):
+    return await pool().fetchrow(
+        "UPDATE listings SET status=$1, updated_at=now() WHERE id=$2 RETURNING *",
+        status, listing_id,
+    )
+
+
 # ---------------------------------------------------------------
 # Users
 # ---------------------------------------------------------------

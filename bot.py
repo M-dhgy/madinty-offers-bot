@@ -58,6 +58,7 @@ BATCH_DELAY_SECONDS = float(os.environ.get("BROADCAST_BATCH_DELAY", "1.5"))
     CAMPAIGN_CONFIRM,
 ) = range(10)
 REDEEM_CODE = 10
+LISTING_TITLE, LISTING_DESCRIPTION, LISTING_PRICE, LISTING_CONDITION, LISTING_CITY, LISTING_CATEGORY = range(11, 17)
 
 BIZ_TYPES = ["مطعم / كافيه", "متجر", "مركز تجميل", "خدمات"]
 
@@ -121,6 +122,14 @@ async def text_role_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "📞 تواصل معنا":
         await update.message.reply_text("للتواصل: @madinty_support")
         return SELECT_ROLE
+    if text == "🛒 سوق الأفراد":
+        await update.message.reply_text(
+            "🛒 سوق الأفراد — النشر مجاني خلال فترة الإطلاق.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("➕ نشر غرض للبيع", callback_data="listing_start")
+            ]]),
+        )
+        return SELECT_ROLE
     return SELECT_ROLE
 
 
@@ -171,6 +180,7 @@ async def show_admin_menu(query):
         "🛠 لوحة الإدارة\n\nاختر الإجراء المطلوب:",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("📋 حملات بانتظار المراجعة", callback_data="admin_pending")],
+            [InlineKeyboardButton("📦 إعلانات أفراد بانتظار المراجعة", callback_data="admin_listings")],
             [InlineKeyboardButton("🔄 تحديث القائمة", callback_data="admin_menu")],
         ]),
     )
@@ -200,6 +210,52 @@ async def admin_pending_callback(update: Update, context: ContextTypes.DEFAULT_T
     await query.edit_message_text(
         "اختر اعتماد أو رفض كل حملة من الرسائل أعلاه.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 لوحة الإدارة", callback_data="admin_menu")]]),
+    )
+
+
+async def admin_listings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        await query.edit_message_text("غير مصرح لك باستخدام لوحة الإدارة.")
+        return
+    rows = await db.list_pending_listings()
+    if not rows:
+        await query.edit_message_text("✅ لا توجد إعلانات أفراد بانتظار المراجعة.")
+        return
+    await query.edit_message_text("📦 إعلانات الأفراد بانتظار المراجعة:")
+    for row in rows:
+        price = str(row["price"]) if row["price"] is not None else "عند التواصل"
+        await query.message.reply_text(
+            f"📦 الإعلان #{row['id']}\n{row['title']}\n"
+            f"السعر: {price}\nالمدينة: {row['city_name'] or 'غير محددة'}\n\n{row['description'] or ''}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ اعتماد", callback_data=f"listing_approve_{row['id']}"),
+                InlineKeyboardButton("❌ رفض", callback_data=f"listing_reject_{row['id']}"),
+            ]]),
+        )
+
+
+async def admin_listing_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        await query.edit_message_text("غير مصرح لك باستخدام لوحة الإدارة.")
+        return
+    try:
+        _, action, listing_id_text = query.data.split("_")
+        listing_id = int(listing_id_text)
+    except (ValueError, IndexError):
+        await query.edit_message_text("تعذر قراءة الإعلان.")
+        return
+    listing = await db.get_listing(listing_id)
+    if not listing or listing["status"] != "pending_review":
+        await query.edit_message_text("هذا الإعلان لم يعد بانتظار المراجعة.")
+        return
+    status = "approved" if action == "approve" else "rejected"
+    await db.set_listing_status(listing_id, status)
+    await query.edit_message_text(
+        f"{'✅ تم اعتماد' if status == 'approved' else '❌ تم رفض'} الإعلان #{listing_id}."
     )
 
 
@@ -790,7 +846,11 @@ async def customer_market_callback(update: Update, context: ContextTypes.DEFAULT
     listings = await db.list_public_listings(user["city_id"] if user else None)
     if not listings:
         await query.edit_message_text(
-            "🛒 سوق الأفراد جاهز لاستقبال الإعلانات، ولا توجد أغراض منشورة في مدينتك حاليًا."
+            "🛒 لا توجد أغراض منشورة في مدينتك حاليًا.\n"
+            "يمكنك أن تكون أول من ينشر غرضًا!",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("➕ نشر غرض للبيع", callback_data="listing_start")
+            ]]),
         )
         return
     await query.edit_message_text("🛒 أحدث الأغراض المعروضة في مدينتك:")
@@ -800,6 +860,102 @@ async def customer_market_callback(update: Update, context: ContextTypes.DEFAULT
             f"📦 {listing['title']}\nالسعر: {price}\n"
             f"الحالة: {listing['condition'] or 'غير محددة'}\n\n{listing['description'] or ''}"
         )
+    await query.message.reply_text(
+        "هل تريد بيع غرض؟ النشر مجاني خلال فترة الإطلاق.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("➕ نشر غرض للبيع", callback_data="listing_start")
+        ]]),
+    )
+
+
+async def listing_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.message.reply_text(
+            "🛒 لنشر غرضك، اكتب اسم الغرض بوضوح (مثال: هاتف سامسونج A54)."
+        )
+    else:
+        await update.message.reply_text("🛒 لنشر غرضك، اكتب اسم الغرض بوضوح (مثال: هاتف سامسونج A54).")
+    return LISTING_TITLE
+
+
+async def listing_title_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    title = (update.message.text or "").strip()
+    if len(title) < 3 or len(title) > 120:
+        await update.message.reply_text("اكتب اسمًا بين 3 و120 حرفًا.")
+        return LISTING_TITLE
+    context.user_data["listing_title"] = title
+    await update.message.reply_text("اكتب وصف الغرض ومواصفاته وحالته بالتفصيل.")
+    return LISTING_DESCRIPTION
+
+
+async def listing_description_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    description = (update.message.text or "").strip()
+    if len(description) < 5:
+        await update.message.reply_text("أضف وصفًا أوضح ليسهل على المشتري فهم الغرض.")
+        return LISTING_DESCRIPTION
+    context.user_data["listing_description"] = description
+    await update.message.reply_text("ما السعر؟ اكتب الرقم فقط، أو اكتب: عند التواصل")
+    return LISTING_PRICE
+
+
+async def listing_price_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    price = (update.message.text or "").strip()
+    if price not in {"عند التواصل", "غير محدد"}:
+        try:
+            if float(price.replace(",", ".")) < 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("اكتب سعرًا صحيحًا أو اكتب: عند التواصل")
+            return LISTING_PRICE
+    context.user_data["listing_price"] = None if price in {"عند التواصل", "غير محدد"} else price
+    await update.message.reply_text("اختر حالة الغرض:", reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("جديد", callback_data="listing_condition_جديد")],
+        [InlineKeyboardButton("مستعمل", callback_data="listing_condition_مستعمل")],
+    ]))
+    return LISTING_CONDITION
+
+
+async def listing_condition_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["listing_condition"] = query.data.rsplit("_", 1)[1]
+    cities = await db.list_cities()
+    await query.edit_message_text("اختر مدينة الغرض:", reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton(city["name"], callback_data=f"listing_city_{city['id']}")]
+        for city in cities
+    ]))
+    return LISTING_CITY
+
+
+async def listing_city_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["listing_city_id"] = int(query.data.rsplit("_", 1)[1])
+    await query.edit_message_text("اكتب تصنيف الغرض (مثال: هواتف، أثاث، أجهزة كهربائية).")
+    return LISTING_CATEGORY
+
+
+async def listing_category_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = context.user_data["db_user_id"]
+    category = (update.message.text or "").strip()[:80]
+    listing = await db.create_listing(
+        user_id,
+        context.user_data["listing_title"],
+        context.user_data["listing_description"],
+        context.user_data.get("listing_price"),
+        context.user_data["listing_condition"],
+        context.user_data["listing_city_id"],
+        category,
+    )
+    await update.message.reply_text(
+        f"✅ تم استلام إعلانك رقم #{listing['id']} وأصبح قيد مراجعة الإدارة.\n"
+        "سيظهر في سوق الأفراد بعد اعتماده. النشر مجاني خلال فترة الإطلاق."
+    )
+    for key in list(context.user_data):
+        if key.startswith("listing_"):
+            context.user_data.pop(key, None)
+    return ConversationHandler.END
 
 
 async def cmd_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -867,10 +1023,14 @@ def build_application() -> Application:
     ), group=0)
 
     conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+        entry_points=[
+            CommandHandler("start", start),
+            CallbackQueryHandler(listing_start, pattern="^listing_start$"),
+        ],
         states={
             SELECT_ROLE: [
                 CallbackQueryHandler(role_router),
+                CallbackQueryHandler(listing_start, pattern="^listing_start$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, text_role_router),
             ],
             CUST_CITY: [CallbackQueryHandler(customer_city_chosen, pattern="^city_")],
@@ -884,6 +1044,12 @@ def build_application() -> Application:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, merchant_text_menu_router),
             ],
             REDEEM_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, merchant_redeem_code_received)],
+            LISTING_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, listing_title_received)],
+            LISTING_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, listing_description_received)],
+            LISTING_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, listing_price_received)],
+            LISTING_CONDITION: [CallbackQueryHandler(listing_condition_received, pattern="^listing_condition_")],
+            LISTING_CITY: [CallbackQueryHandler(listing_city_received, pattern="^listing_city_")],
+            LISTING_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, listing_category_received)],
             CAMPAIGN_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, campaign_description_received)],
             CAMPAIGN_CONFIRM: [CallbackQueryHandler(campaign_confirm_router)],
         },
@@ -903,13 +1069,16 @@ def build_application() -> Application:
 
     # استلام كود الخصم من رسالة الحملة المُرسلة للعميل
     application.add_handler(CallbackQueryHandler(admin_pending_callback, pattern="^admin_pending$"))
+    application.add_handler(CallbackQueryHandler(admin_listings_callback, pattern="^admin_listings$"))
     application.add_handler(CallbackQueryHandler(admin_campaign_action, pattern=r"^admin_(approve|reject)_\d+$"))
+    application.add_handler(CallbackQueryHandler(admin_listing_action, pattern=r"^listing_(approve|reject)_\d+$"))
     application.add_handler(CallbackQueryHandler(admin_send_callback, pattern=r"^admin_send_\d+$"))
     application.add_handler(CallbackQueryHandler(get_discount_code, pattern="^getcode_"))
     application.add_handler(CallbackQueryHandler(merchant_redeem_prompt_fallback, pattern="^redeem_menu$"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, merchant_redeem_fallback_message))
     application.add_handler(CallbackQueryHandler(customer_directory_callback, pattern="^customer_directory$"))
     application.add_handler(CallbackQueryHandler(customer_market_callback, pattern="^customer_market$"))
+    application.add_handler(CallbackQueryHandler(listing_start, pattern="^listing_start$"))
     application.add_error_handler(on_error)
 
     return application
