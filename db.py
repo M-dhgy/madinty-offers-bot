@@ -31,6 +31,22 @@ async def init_pool():
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
         CREATE INDEX IF NOT EXISTS idx_listings_search ON listings(status, city_id, created_at DESC);
+        CREATE TABLE IF NOT EXISTS listing_events (
+            id SERIAL PRIMARY KEY,
+            listing_id INTEGER NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+            user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            event_type TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE TABLE IF NOT EXISTS business_events (
+            id SERIAL PRIMARY KEY,
+            business_id INTEGER NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+            user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            event_type TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE INDEX IF NOT EXISTS idx_listing_events_listing ON listing_events(listing_id, event_type);
+        CREATE INDEX IF NOT EXISTS idx_business_events_business ON business_events(business_id, event_type);
     """)
     return _pool
 
@@ -58,7 +74,8 @@ async def list_categories():
 
 
 async def list_public_businesses(city_id: int | None = None, business_type: str | None = None):
-    query = """SELECT b.*, c.name AS city_name FROM businesses b
+    query = """SELECT b.*, c.name AS city_name, u.telegram_id AS owner_telegram_id
+               FROM businesses b JOIN users u ON u.id=b.user_id
                LEFT JOIN cities c ON c.id=b.city_id
                WHERE b.status IN ('pending', 'approved')"""
     args = []
@@ -70,6 +87,14 @@ async def list_public_businesses(city_id: int | None = None, business_type: str 
         query += f" AND b.business_type=${len(args)}"
     query += " ORDER BY b.status='approved' DESC, b.id DESC LIMIT 30"
     return await pool().fetch(query, *args)
+
+
+async def get_business(business_id: int):
+    return await pool().fetchrow(
+        "SELECT b.*, u.telegram_id AS owner_telegram_id FROM businesses b "
+        "JOIN users u ON u.id=b.user_id WHERE b.id=$1",
+        business_id,
+    )
 
 
 async def create_listing(user_id: int, title: str, description: str, price: str | None,
@@ -88,7 +113,8 @@ async def create_listing(user_id: int, title: str, description: str, price: str 
 
 
 async def list_public_listings(city_id: int | None = None, category: str | None = None):
-    query = """SELECT l.*, c.name AS city_name FROM listings l
+    query = """SELECT l.*, c.name AS city_name, u.telegram_id AS owner_telegram_id
+               FROM listings l JOIN users u ON u.id=l.user_id
                LEFT JOIN cities c ON c.id=l.city_id
                WHERE l.status='approved'"""
     args = []
@@ -122,11 +148,45 @@ async def set_listing_status(listing_id: int, status: str):
     )
 
 
+async def log_listing_event(listing_id: int, user_id: int | None, event_type: str):
+    await pool().execute(
+        "INSERT INTO listing_events (listing_id, user_id, event_type) VALUES ($1,$2,$3)",
+        listing_id, user_id, event_type,
+    )
+
+
+async def listing_report(listing_id: int):
+    rows = await pool().fetch(
+        "SELECT event_type, COUNT(*) AS count FROM listing_events WHERE listing_id=$1 GROUP BY event_type",
+        listing_id,
+    )
+    return {row["event_type"].lower(): row["count"] for row in rows}
+
+
+async def log_business_event(business_id: int, user_id: int | None, event_type: str):
+    await pool().execute(
+        "INSERT INTO business_events (business_id, user_id, event_type) VALUES ($1,$2,$3)",
+        business_id, user_id, event_type,
+    )
+
+
+async def business_report(business_id: int):
+    rows = await pool().fetch(
+        "SELECT event_type, COUNT(*) AS count FROM business_events WHERE business_id=$1 GROUP BY event_type",
+        business_id,
+    )
+    return {row["event_type"].lower(): row["count"] for row in rows}
+
+
 # ---------------------------------------------------------------
 # Users
 # ---------------------------------------------------------------
 async def get_user_by_telegram_id(telegram_id: int):
     return await pool().fetchrow("SELECT * FROM users WHERE telegram_id=$1", telegram_id)
+
+
+async def get_user_by_id(user_id: int):
+    return await pool().fetchrow("SELECT * FROM users WHERE id=$1", user_id)
 
 
 async def create_user(telegram_id: int, username: str | None, first_name: str | None):

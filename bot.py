@@ -181,9 +181,38 @@ async def show_admin_menu(query):
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("📋 حملات بانتظار المراجعة", callback_data="admin_pending")],
             [InlineKeyboardButton("📦 إعلانات أفراد بانتظار المراجعة", callback_data="admin_listings")],
+            [InlineKeyboardButton("📊 تقارير الوصول والتواصل", callback_data="admin_reports")],
             [InlineKeyboardButton("🔄 تحديث القائمة", callback_data="admin_menu")],
         ]),
     )
+
+
+async def admin_reports_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update):
+        await query.edit_message_text("غير مصرح لك باستخدام لوحة الإدارة.")
+        return
+    listings = await db.pool().fetch(
+        """SELECT l.id, l.title,
+           COUNT(*) FILTER (WHERE e.event_type='VIEW') AS views,
+           COUNT(*) FILTER (WHERE e.event_type='CONTACT') AS contacts
+           FROM listings l LEFT JOIN listing_events e ON e.listing_id=l.id
+           WHERE l.status='approved' GROUP BY l.id ORDER BY l.id DESC LIMIT 15"""
+    )
+    businesses = await db.pool().fetch(
+        """SELECT b.id, b.business_name,
+           COUNT(*) FILTER (WHERE e.event_type='VIEW') AS views,
+           COUNT(*) FILTER (WHERE e.event_type='CONTACT') AS contacts
+           FROM businesses b LEFT JOIN business_events e ON e.business_id=b.id
+           WHERE b.status IN ('pending','approved') GROUP BY b.id ORDER BY b.id DESC LIMIT 15"""
+    )
+    lines = ["📊 تقارير الوصول والتواصل\n"]
+    lines.append("📦 إعلانات الأفراد:")
+    lines.extend(f"#{r['id']} {r['title']} — مشاهدة: {r['views']} | تواصل: {r['contacts']}" for r in listings)
+    lines.append("\n🏪 الأنشطة التجارية:")
+    lines.extend(f"#{r['id']} {r['business_name']} — مشاهدة: {r['views']} | تواصل: {r['contacts']}" for r in businesses)
+    await query.edit_message_text("\n".join(lines)[:4000])
 
 
 async def admin_pending_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -254,6 +283,16 @@ async def admin_listing_action(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     status = "approved" if action == "approve" else "rejected"
     await db.set_listing_status(listing_id, status)
+    try:
+        owner = await db.get_user_by_id(listing["user_id"])
+        if owner:
+            await context.bot.send_message(
+                owner["telegram_id"],
+                f"{'✅ تم اعتماد' if status == 'approved' else '❌ تم رفض'} إعلانك رقم #{listing_id}.\n"
+                + ("أصبح ظاهرًا الآن في سوق الأفراد." if status == "approved" else "يمكنك تعديل البيانات وإعادة المحاولة لاحقًا."),
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("تعذر إشعار صاحب الإعلان %s: %s", listing_id, exc)
     await query.edit_message_text(
         f"{'✅ تم اعتماد' if status == 'approved' else '❌ تم رفض'} الإعلان #{listing_id}."
     )
@@ -831,11 +870,16 @@ async def customer_directory_callback(update: Update, context: ContextTypes.DEFA
         return
     await query.edit_message_text("🏪 دليل الأنشطة في مدينتك:")
     for business in businesses:
+        if user:
+            await db.log_business_event(business["id"], user["id"], "VIEW")
         await query.message.reply_text(
             f"🏪 {business['business_name']}\n"
             f"التصنيف: {business['business_type'] or 'خدمات'}\n"
             f"المدينة: {business['city_name'] or 'غير محددة'}\n"
-            f"📞 {business['phone'] or 'لا يوجد رقم مسجل'}"
+            f"📞 {business['phone'] or 'لا يوجد رقم مسجل'}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📩 تواصل مع النشاط", callback_data=f"business_contact_{business['id']}"),
+            ]]),
         )
 
 
@@ -855,16 +899,66 @@ async def customer_market_callback(update: Update, context: ContextTypes.DEFAULT
         return
     await query.edit_message_text("🛒 أحدث الأغراض المعروضة في مدينتك:")
     for listing in listings:
+        if user:
+            await db.log_listing_event(listing["id"], user["id"], "VIEW")
         price = str(listing["price"]) if listing["price"] is not None else "السعر عند التواصل"
         await query.message.reply_text(
             f"📦 {listing['title']}\nالسعر: {price}\n"
-            f"الحالة: {listing['condition'] or 'غير محددة'}\n\n{listing['description'] or ''}"
+            f"الحالة: {listing['condition'] or 'غير محددة'}\n\n{listing['description'] or ''}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📩 تواصل مع المعلن", callback_data=f"listing_contact_{listing['id']}"),
+            ]]),
         )
     await query.message.reply_text(
         "هل تريد بيع غرض؟ النشر مجاني خلال فترة الإطلاق.",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("➕ نشر غرض للبيع", callback_data="listing_start")
         ]]),
+    )
+
+
+async def listing_contact_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        listing_id = int(query.data.rsplit("_", 1)[1])
+    except (ValueError, IndexError):
+        await query.edit_message_text("تعذر قراءة الإعلان.")
+        return
+    listing = await db.get_listing(listing_id)
+    buyer = await db.get_user_by_telegram_id(update.effective_user.id)
+    if not listing or listing["status"] != "approved":
+        await query.answer("الإعلان غير متاح حاليًا.", show_alert=True)
+        return
+    owner = await db.get_user_by_id(listing["user_id"])
+    await db.log_listing_event(listing_id, buyer["id"] if buyer else None, "CONTACT")
+    if owner:
+        await context.bot.send_message(
+            owner["telegram_id"],
+            f"📩 يوجد مستخدم مهتم بإعلانك #{listing_id}: {listing['title']}\n"
+            "يمكنك التواصل معه عبر Telegram.",
+        )
+    await query.message.reply_text(
+        f"للتواصل مع المعلن: {('@' + owner['username']) if owner and owner['username'] else 'سيصلك إشعار من المعلن قريبًا.'}"
+    )
+
+
+async def business_contact_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        business_id = int(query.data.rsplit("_", 1)[1])
+    except (ValueError, IndexError):
+        await query.edit_message_text("تعذر قراءة النشاط.")
+        return
+    business = await db.get_business(business_id)
+    buyer = await db.get_user_by_telegram_id(update.effective_user.id)
+    if not business:
+        await query.answer("النشاط غير متاح حاليًا.", show_alert=True)
+        return
+    await db.log_business_event(business_id, buyer["id"] if buyer else None, "CONTACT")
+    await query.message.reply_text(
+        f"للتواصل مع {business['business_name']}: {business['phone'] or 'لا يوجد رقم مسجل'}"
     )
 
 
@@ -1031,6 +1125,7 @@ def build_application() -> Application:
             SELECT_ROLE: [
                 CallbackQueryHandler(admin_pending_callback, pattern="^admin_pending$"),
                 CallbackQueryHandler(admin_listings_callback, pattern="^admin_listings$"),
+                CallbackQueryHandler(admin_reports_callback, pattern="^admin_reports$"),
                 CallbackQueryHandler(admin_campaign_action, pattern=r"^admin_(approve|reject)_\d+$"),
                 CallbackQueryHandler(admin_listing_action, pattern=r"^listing_(approve|reject)_\d+$"),
                 CallbackQueryHandler(admin_send_callback, pattern=r"^admin_send_\d+$"),
@@ -1075,6 +1170,7 @@ def build_application() -> Application:
     # استلام كود الخصم من رسالة الحملة المُرسلة للعميل
     application.add_handler(CallbackQueryHandler(admin_pending_callback, pattern="^admin_pending$"))
     application.add_handler(CallbackQueryHandler(admin_listings_callback, pattern="^admin_listings$"))
+    application.add_handler(CallbackQueryHandler(admin_reports_callback, pattern="^admin_reports$"))
     application.add_handler(CallbackQueryHandler(admin_campaign_action, pattern=r"^admin_(approve|reject)_\d+$"))
     application.add_handler(CallbackQueryHandler(admin_listing_action, pattern=r"^listing_(approve|reject)_\d+$"))
     application.add_handler(CallbackQueryHandler(admin_send_callback, pattern=r"^admin_send_\d+$"))
@@ -1083,6 +1179,8 @@ def build_application() -> Application:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, merchant_redeem_fallback_message))
     application.add_handler(CallbackQueryHandler(customer_directory_callback, pattern="^customer_directory$"))
     application.add_handler(CallbackQueryHandler(customer_market_callback, pattern="^customer_market$"))
+    application.add_handler(CallbackQueryHandler(listing_contact_callback, pattern=r"^listing_contact_\d+$"))
+    application.add_handler(CallbackQueryHandler(business_contact_callback, pattern=r"^business_contact_\d+$"))
     application.add_handler(CallbackQueryHandler(listing_start, pattern="^listing_start$"))
     application.add_error_handler(on_error)
 
