@@ -1029,6 +1029,11 @@ def build_application() -> Application:
         ],
         states={
             SELECT_ROLE: [
+                CallbackQueryHandler(admin_pending_callback, pattern="^admin_pending$"),
+                CallbackQueryHandler(admin_listings_callback, pattern="^admin_listings$"),
+                CallbackQueryHandler(admin_campaign_action, pattern=r"^admin_(approve|reject)_\d+$"),
+                CallbackQueryHandler(admin_listing_action, pattern=r"^listing_(approve|reject)_\d+$"),
+                CallbackQueryHandler(admin_send_callback, pattern=r"^admin_send_\d+$"),
                 CallbackQueryHandler(role_router),
                 CallbackQueryHandler(listing_start, pattern="^listing_start$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, text_role_router),
