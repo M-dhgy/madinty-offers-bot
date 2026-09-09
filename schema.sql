@@ -98,6 +98,9 @@ CREATE TABLE IF NOT EXISTS listings (
     condition    TEXT,
     city_id      INTEGER REFERENCES cities(id),
     category     TEXT,
+    address      TEXT,
+    contact      TEXT,
+    delivery     TEXT,
     status       TEXT NOT NULL DEFAULT 'pending_review',
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()

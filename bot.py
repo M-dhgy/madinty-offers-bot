@@ -59,6 +59,7 @@ BATCH_DELAY_SECONDS = float(os.environ.get("BROADCAST_BATCH_DELAY", "1.5"))
 ) = range(10)
 REDEEM_CODE = 10
 LISTING_TITLE, LISTING_DESCRIPTION, LISTING_PRICE, LISTING_CONDITION, LISTING_CITY, LISTING_CATEGORY = range(11, 17)
+LISTING_ADDRESS, LISTING_CONTACT, LISTING_DELIVERY = range(17, 20)
 
 BIZ_TYPES = ["مطعم / كافيه", "متجر", "مركز تجميل", "خدمات"]
 
@@ -77,6 +78,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = [
         [InlineKeyboardButton("🔎 أبحث عن عروض", callback_data="role_customer")],
+        [InlineKeyboardButton("🛒 سوق الأفراد", callback_data="customer_market")],
         [InlineKeyboardButton("🏪 صاحب نشاط تجاري", callback_data="role_merchant")],
         [InlineKeyboardButton("ℹ️ كيف يعمل؟", callback_data="how_it_works")],
         [InlineKeyboardButton("📞 تواصل معنا", callback_data="contact_us")],
@@ -91,7 +93,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "يمكنك أيضًا استخدام القائمة العربية أسفل الشاشة للتنقل بسهولة.",
         reply_markup=ReplyKeyboardMarkup(
-            [["🔎 أبحث عن عروض", "🏪 صاحب نشاط تجاري"], ["ℹ️ كيف يعمل؟", "📞 تواصل معنا"]],
+            [["🔎 أبحث عن عروض", "🛒 سوق الأفراد"], ["🏪 صاحب نشاط تجاري"], ["ℹ️ كيف يعمل؟", "📞 تواصل معنا"]],
             resize_keyboard=True,
             is_persistent=True,
         ),
@@ -257,7 +259,9 @@ async def admin_listings_callback(update: Update, context: ContextTypes.DEFAULT_
         price = str(row["price"]) if row["price"] is not None else "عند التواصل"
         await query.message.reply_text(
             f"📦 الإعلان #{row['id']}\n{row['title']}\n"
-            f"السعر: {price}\nالمدينة: {row['city_name'] or 'غير محددة'}\n\n{row['description'] or ''}",
+            f"السعر: {price}\nالعنوان: {row['address'] or 'غير محدد'}\n"
+            f"التواصل: {row['contact'] or 'غير محدد'}\nالتوصيل: {row['delivery'] or 'غير محدد'}\n\n"
+            f"{row['description'] or ''}",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("✅ اعتماد", callback_data=f"listing_approve_{row['id']}"),
                 InlineKeyboardButton("❌ رفض", callback_data=f"listing_reject_{row['id']}"),
@@ -887,7 +891,8 @@ async def customer_market_callback(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
     user = await db.get_user_by_telegram_id(update.effective_user.id)
-    listings = await db.list_public_listings(user["city_id"] if user else None)
+    # سوق الأفراد عام؛ العنوان يكتبه المعلن داخل تفاصيل الإعلان.
+    listings = await db.list_public_listings()
     if not listings:
         await query.edit_message_text(
             "🛒 لا توجد أغراض منشورة في مدينتك حاليًا.\n"
@@ -904,7 +909,10 @@ async def customer_market_callback(update: Update, context: ContextTypes.DEFAULT
         price = str(listing["price"]) if listing["price"] is not None else "السعر عند التواصل"
         await query.message.reply_text(
             f"📦 {listing['title']}\nالسعر: {price}\n"
-            f"الحالة: {listing['condition'] or 'غير محددة'}\n\n{listing['description'] or ''}",
+            f"الحالة: {listing['condition'] or 'غير محددة'}\n"
+            f"📍 العنوان: {listing['address'] or 'غير محدد'}\n"
+            f"📞 التواصل: {listing['contact'] or 'غير محدد'}\n"
+            f"🚚 التوصيل: {listing['delivery'] or 'غير محدد'}\n\n{listing['description'] or ''}",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("📩 تواصل مع المعلن", callback_data=f"listing_contact_{listing['id']}"),
             ]]),
@@ -1014,12 +1022,8 @@ async def listing_condition_received(update: Update, context: ContextTypes.DEFAU
     query = update.callback_query
     await query.answer()
     context.user_data["listing_condition"] = query.data.rsplit("_", 1)[1]
-    cities = await db.list_cities()
-    await query.edit_message_text("اختر مدينة الغرض:", reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton(city["name"], callback_data=f"listing_city_{city['id']}")]
-        for city in cities
-    ]))
-    return LISTING_CITY
+    await query.edit_message_text("اكتب تصنيف الغرض (مثال: هواتف، أثاث، أجهزة كهربائية).")
+    return LISTING_CATEGORY
 
 
 async def listing_city_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1031,16 +1035,37 @@ async def listing_city_received(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def listing_category_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["listing_category"] = (update.message.text or "").strip()[:80]
+    await update.message.reply_text("اكتب عنوان أو موقع الغرض بالتفصيل، مثل الحي أو السوق.")
+    return LISTING_ADDRESS
+
+
+async def listing_address_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["listing_address"] = (update.message.text or "").strip()[:200]
+    await update.message.reply_text("اكتب رقم الهاتف أو وسيلة التواصل التي تريد إظهارها للمشتري.")
+    return LISTING_CONTACT
+
+
+async def listing_contact_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["listing_contact"] = (update.message.text or "").strip()[:120]
+    await update.message.reply_text("هل توجد خدمة توصيل؟ اكتب نعم مع التفاصيل أو لا.")
+    return LISTING_DELIVERY
+
+
+async def listing_delivery_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = context.user_data["db_user_id"]
-    category = (update.message.text or "").strip()[:80]
+    delivery = (update.message.text or "").strip()[:160]
     listing = await db.create_listing(
         user_id,
         context.user_data["listing_title"],
         context.user_data["listing_description"],
         context.user_data.get("listing_price"),
         context.user_data["listing_condition"],
-        context.user_data["listing_city_id"],
-        category,
+        None,
+        context.user_data["listing_category"],
+        context.user_data["listing_address"],
+        context.user_data["listing_contact"],
+        delivery,
     )
     await update.message.reply_text(
         f"✅ تم استلام إعلانك رقم #{listing['id']} وأصبح قيد مراجعة الإدارة.\n"
@@ -1129,6 +1154,7 @@ def build_application() -> Application:
                 CallbackQueryHandler(admin_campaign_action, pattern=r"^admin_(approve|reject)_\d+$"),
                 CallbackQueryHandler(admin_listing_action, pattern=r"^listing_(approve|reject)_\d+$"),
                 CallbackQueryHandler(admin_send_callback, pattern=r"^admin_send_\d+$"),
+                CallbackQueryHandler(customer_market_callback, pattern="^customer_market$"),
                 CallbackQueryHandler(role_router),
                 CallbackQueryHandler(listing_start, pattern="^listing_start$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, text_role_router),
@@ -1150,6 +1176,9 @@ def build_application() -> Application:
             LISTING_CONDITION: [CallbackQueryHandler(listing_condition_received, pattern="^listing_condition_")],
             LISTING_CITY: [CallbackQueryHandler(listing_city_received, pattern="^listing_city_")],
             LISTING_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, listing_category_received)],
+            LISTING_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, listing_address_received)],
+            LISTING_CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, listing_contact_received)],
+            LISTING_DELIVERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, listing_delivery_received)],
             CAMPAIGN_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, campaign_description_received)],
             CAMPAIGN_CONFIRM: [CallbackQueryHandler(campaign_confirm_router)],
         },

@@ -26,6 +26,9 @@ async def init_pool():
             condition TEXT,
             city_id INTEGER REFERENCES cities(id),
             category TEXT,
+            address TEXT,
+            contact TEXT,
+            delivery TEXT,
             status TEXT NOT NULL DEFAULT 'pending_review',
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -47,6 +50,9 @@ async def init_pool():
         );
         CREATE INDEX IF NOT EXISTS idx_listing_events_listing ON listing_events(listing_id, event_type);
         CREATE INDEX IF NOT EXISTS idx_business_events_business ON business_events(business_id, event_type);
+        ALTER TABLE listings ADD COLUMN IF NOT EXISTS address TEXT;
+        ALTER TABLE listings ADD COLUMN IF NOT EXISTS contact TEXT;
+        ALTER TABLE listings ADD COLUMN IF NOT EXISTS delivery TEXT;
     """)
     return _pool
 
@@ -98,7 +104,8 @@ async def get_business(business_id: int):
 
 
 async def create_listing(user_id: int, title: str, description: str, price: str | None,
-                         condition: str, city_id: int | None, category: str):
+                         condition: str, city_id: int | None, category: str,
+                         address: str, contact: str, delivery: str):
     parsed_price = None
     if price:
         try:
@@ -106,9 +113,11 @@ async def create_listing(user_id: int, title: str, description: str, price: str 
         except ValueError:
             parsed_price = None
     return await pool().fetchrow(
-        """INSERT INTO listings (user_id, title, description, price, condition, city_id, category)
-           VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *""",
+        """INSERT INTO listings
+           (user_id, title, description, price, condition, city_id, category, address, contact, delivery)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *""",
         user_id, title, description, parsed_price, condition, city_id, category,
+        address, contact, delivery,
     )
 
 
