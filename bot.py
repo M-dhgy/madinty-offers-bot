@@ -990,14 +990,26 @@ async def business_contact_callback(update: Update, context: ContextTypes.DEFAUL
 
 
 async def listing_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = (
+        "🏷️ لنشر إعلانك، يجب إكمال جميع البيانات التالية:\n\n"
+        "1️⃣ صورة للغرض — صورة واحدة على الأقل وبحد أقصى صورتين\n"
+        "2️⃣ اسم الغرض ووصفه\n"
+        "3️⃣ السعر، وهل هو نهائي أم قابل للتفاوض\n"
+        "4️⃣ عنوان ومكان وجود الغرض أو البائع\n"
+        "5️⃣ رقم التواصل\n"
+        "6️⃣ هل توجد خدمة توصيل؟\n\n"
+        "لن يُرسل الإعلان إلى الإدارة إلا بعد اكتمال التفاصيل."
+    )
     if update.callback_query:
         await update.callback_query.answer()
-        await update.callback_query.message.reply_text(
-            "🛒 لنشر غرضك، اكتب اسم الغرض بوضوح (مثال: هاتف سامسونج A54)."
-        )
+        await update.callback_query.message.reply_text(message)
     else:
-        await update.message.reply_text("🛒 لنشر غرضك، اكتب اسم الغرض بوضوح (مثال: هاتف سامسونج A54).")
-    return LISTING_TITLE
+        await update.message.reply_text(message)
+    context.user_data["listing_photos"] = []
+    await (update.callback_query.message if update.callback_query else update.message).reply_text(
+        "📷 أرسل الآن صورة الغرض الأولى. الصورة إلزامية."
+    )
+    return LISTING_PHOTOS
 
 
 async def listing_title_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1016,14 +1028,18 @@ async def listing_photo_received(update: Update, context: ContextTypes.DEFAULT_T
     if update.message.photo and len(photos) < 2:
         photos.append(update.message.photo[-1].file_id)
         if len(photos) == 1:
-            await update.message.reply_text("تم حفظ الصورة الأولى. أرسل صورة ثانية أو اكتب: تم")
+            await update.message.reply_text("✅ تم حفظ الصورة الأولى. أرسل صورة ثانية أو اكتب: تم للمتابعة")
             return LISTING_PHOTOS
-        await update.message.reply_text("تم حفظ صورتين. اكتب وصف الغرض ومواصفاته بالتفصيل.")
-        return LISTING_DESCRIPTION
-    if (update.message.text or "").strip() in {"بدون صورة", "تم"}:
-        await update.message.reply_text("اكتب وصف الغرض ومواصفاته وحالته بالتفصيل.")
-        return LISTING_DESCRIPTION
-    await update.message.reply_text("أرسل صورة صحيحة أو اكتب: تم للمتابعة.")
+        await update.message.reply_text("تم حفظ صورتين. اكتب اسم الغرض بوضوح.")
+        return LISTING_TITLE
+    if (update.message.text or "").strip() == "تم" and photos:
+        await update.message.reply_text("اكتب اسم الغرض بوضوح.")
+        return LISTING_TITLE
+    if not photos:
+        await update.message.reply_text("⚠️ الصورة إلزامية. أرسل صورة واضحة للغرض أولًا.")
+    else:
+        await update.message.reply_text("اكتب اسم الغرض بوضوح.")
+        return LISTING_TITLE
     return LISTING_PHOTOS
 
 
@@ -1088,20 +1104,32 @@ async def listing_category_received(update: Update, context: ContextTypes.DEFAUL
 
 
 async def listing_address_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["listing_address"] = (update.message.text or "").strip()[:200]
+    address = (update.message.text or "").strip()
+    if len(address) < 3:
+        await update.message.reply_text("العنوان أو مكان وجود الغرض إلزامي. اكتب الحي أو السوق أو الموقع.")
+        return LISTING_ADDRESS
+    context.user_data["listing_address"] = address[:200]
     await update.message.reply_text("اكتب رقم الهاتف أو وسيلة التواصل التي تريد إظهارها للمشتري.")
     return LISTING_CONTACT
 
 
 async def listing_contact_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["listing_contact"] = (update.message.text or "").strip()[:120]
+    contact = (update.message.text or "").strip()
+    if len(contact) < 5:
+        await update.message.reply_text("رقم التواصل إلزامي. أرسل رقم هاتف صحيحًا أو وسيلة تواصل واضحة.")
+        return LISTING_CONTACT
+    context.user_data["listing_contact"] = contact[:120]
     await update.message.reply_text("هل توجد خدمة توصيل؟ اكتب نعم مع التفاصيل أو لا.")
     return LISTING_DELIVERY
 
 
 async def listing_delivery_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = context.user_data["db_user_id"]
-    delivery = (update.message.text or "").strip()[:160]
+    delivery = (update.message.text or "").strip()
+    if len(delivery) < 2:
+        await update.message.reply_text("اكتب: لا، أو اذكر تفاصيل خدمة التوصيل.")
+        return LISTING_DELIVERY
+    delivery = delivery[:160]
     review = await ai.review_listing({
         "title": context.user_data["listing_title"],
         "description": context.user_data["listing_description"],
