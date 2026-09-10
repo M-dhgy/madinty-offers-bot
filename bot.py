@@ -61,6 +61,7 @@ REDEEM_CODE = 10
 LISTING_TITLE, LISTING_DESCRIPTION, LISTING_PRICE, LISTING_CONDITION, LISTING_CITY, LISTING_CATEGORY = range(11, 17)
 LISTING_ADDRESS, LISTING_CONTACT, LISTING_DELIVERY = range(17, 20)
 LISTING_PHOTOS, LISTING_NEGOTIABLE = range(20, 22)
+LISTING_SINGLE_MESSAGE, MARKET_QUERY = range(22, 24)
 
 BIZ_TYPES = ["مطعم / كافيه", "متجر", "مركز تجميل", "خدمات"]
 
@@ -895,12 +896,48 @@ async def customer_market_callback(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
     await query.edit_message_text(
-        "🛒 سوق الأفراد\n\nاختر ما تريد:",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🛍️ شراء والبحث عن غرض", callback_data="market_buy")],
-            [InlineKeyboardButton("🏷️ بيع غرض", callback_data="listing_start")],
-        ]),
+        "🛒 اكتب ما تبحث عنه في سوق الأفراد بكلمة أو جملة مختصرة:\n"
+        "مثال: هاتف آيفون مستعمل أو تلفاز 50 بوصة بسعر مناسب"
     )
+    return MARKET_QUERY
+
+
+async def _current_db_user_id(update: Update):
+    user = await db.get_user_by_telegram_id(update.effective_user.id)
+    return user["id"] if user else None
+
+
+async def market_query_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query_text = (update.message.text or "").strip()
+    if len(query_text) < 2:
+        await update.message.reply_text("اكتب كلمة أو جملة أوضح لما تبحث عنه.")
+        return MARKET_QUERY
+    await update.message.reply_text("🔎 جارٍ البحث عن أفضل الإعلانات المطابقة...")
+    listings = await db.list_public_listings()
+    ranked_ids = await ai.rank_listing_ids(query_text, listings)
+    by_id = {row["id"]: row for row in listings}
+    matches = [by_id[x] for x in ranked_ids[:5] if x in by_id]
+    if not matches:
+        await update.message.reply_text("لم نجد إعلانًا مطابقًا حاليًا. جرّب كلمات مختلفة لاحقًا.")
+        return ConversationHandler.END
+    await update.message.reply_text(f"✅ أفضل {len(matches)} إعلانات مطابقة:")
+    for listing in matches:
+        await db.log_listing_event(listing["id"], await _current_db_user_id(update), "VIEW")
+        for photo_id in (listing["image_file_ids"] or [])[:2]:
+            await update.message.reply_photo(photo_id)
+        price = str(listing["price"]) if listing["price"] is not None else "عند التواصل"
+        await update.message.reply_text(
+            f"📦 {listing['title']}\nالسعر: {price}\n"
+            f"التفاوض: {'مسموح' if listing['negotiable'] else 'غير مسموح'}\n"
+            f"📍 {listing['address'] or 'غير محدد'}\n🚚 {listing['delivery'] or 'غير محدد'}\n"
+            f"{listing['description'] or ''}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📩 تواصل مع المعلن", callback_data=f"listing_contact_{listing['id']}"),
+            ]]),
+        )
+    if len(ranked_ids) > 5:
+        await update.message.reply_text("يوجد المزيد من الإعلانات المطابقة، يمكنك البحث بعبارة أدق.")
+    return ConversationHandler.END
 
 
 async def customer_market_browse_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1005,11 +1042,45 @@ async def listing_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.message.reply_text(message)
     else:
         await update.message.reply_text(message)
-    context.user_data["listing_photos"] = []
     await (update.callback_query.message if update.callback_query else update.message).reply_text(
-        "📷 أرسل الآن صورة الغرض الأولى. الصورة إلزامية."
+        "📷 أرسل الآن صورة الغرض مع كتابة جميع التفاصيل في شرح الصورة (Caption) برسالة واحدة.\n\n"
+        "مثال: هاتف Samsung A54 مستعمل بحالة جيدة، السعر 800،000 نهائي، موجود في بحري السوق العربي، "
+        "التواصل 09xxxxxxxx، لا يوجد توصيل."
     )
-    return LISTING_PHOTOS
+    return LISTING_SINGLE_MESSAGE
+
+
+async def listing_single_message_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.photo or not (update.message.caption or "").strip():
+        await update.message.reply_text("⚠️ أرسل صورة الغرض واكتب كل التفاصيل في شرح الصورة برسالة واحدة.")
+        return LISTING_SINGLE_MESSAGE
+    caption = update.message.caption.strip()
+    parsed = await ai.extract_listing_data(caption)
+    issues = parsed.get("issues") or []
+    required = {
+        "العنوان/الموقع": parsed.get("address"),
+        "وسيلة التواصل": parsed.get("contact"),
+        "السعر": parsed.get("price"),
+        "التفاوض (نهائي أو قابل للتفاوض)": parsed.get("negotiable"),
+        "الوصف": parsed.get("description"),
+    }
+    missing = [name for name, value in required.items() if value in (None, "", [])]
+    if missing or issues:
+        details = "\n".join(f"- {x}" for x in (issues + [f"أضف: {x}" for x in missing]))
+        await update.message.reply_text("⚠️ لم تكتمل بيانات الإعلان:\n" + details + "\n\nأرسل صورة جديدة مع التفاصيل كاملة.")
+        return LISTING_SINGLE_MESSAGE
+    user_id = context.user_data["db_user_id"]
+    listing = await db.create_listing(
+        user_id, parsed.get("title") or "غرض للبيع", parsed["description"],
+        str(parsed["price"]), None, None, parsed.get("category") or "عام",
+        parsed["address"], parsed["contact"], parsed.get("delivery") or "لا",
+        bool(parsed["negotiable"]), [update.message.photo[-1].file_id],
+    )
+    await update.message.reply_text(
+        f"✅ اكتملت البيانات وتمت مراجعة الإعلان مبدئيًا بالذكاء الاصطناعي.\n"
+        f"أُرسل الإعلان #{listing['id']} إلى الإدارة للموافقة النهائية."
+    )
+    return ConversationHandler.END
 
 
 async def listing_title_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1302,6 +1373,7 @@ def build_application() -> Application:
             ],
             REDEEM_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, merchant_redeem_code_received)],
             LISTING_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, listing_title_received)],
+            LISTING_SINGLE_MESSAGE: [MessageHandler(filters.PHOTO, listing_single_message_received)],
             LISTING_PHOTOS: [
                 MessageHandler(filters.PHOTO, listing_photo_received),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, listing_photo_received),
@@ -1315,6 +1387,7 @@ def build_application() -> Application:
             LISTING_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, listing_address_received)],
             LISTING_CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, listing_contact_received)],
             LISTING_DELIVERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, listing_delivery_received)],
+            MARKET_QUERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, market_query_received)],
             CAMPAIGN_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, campaign_description_received)],
             CAMPAIGN_CONFIRM: [CallbackQueryHandler(campaign_confirm_router)],
         },

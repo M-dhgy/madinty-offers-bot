@@ -114,3 +114,51 @@ async def review_listing(data: dict) -> dict:
     except Exception:
         # لا نمنع المستخدم من النشر عند تعذر خدمة الذكاء؛ الإدارة تراجع الإعلان.
         return {"issues": [], "ai_unavailable": True}
+
+
+LISTING_PARSE_PROMPT = """
+استخرج من رسالة بائع عربية بيانات إعلان فردي. أعد JSON فقط:
+{"title":"","description":"","price":"","negotiable":true,"address":"","contact":"","delivery":"","condition":"جديد أو مستعمل","category":"","issues":[]}
+اعتبر الحقول ناقصة إذا لم يذكرها البائع بوضوح. السعر يمكن أن يكون «عند التواصل»، والتفاوض يجب أن يكون نعم أو لا بوضوح.
+لا تخترع أي معلومة. ضع الملاحظات الناقصة في issues.
+"""
+
+
+async def extract_listing_data(raw_text: str) -> dict:
+    try:
+        resp = await client().chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": LISTING_PARSE_PROMPT},
+                {"role": "user", "content": raw_text},
+            ],
+            temperature=0.1,
+            response_format={"type": "json_object"},
+        )
+        result = json.loads(resp.choices[0].message.content or "{}")
+        return result if isinstance(result, dict) else {"issues": ["تعذر قراءة البيانات."]}
+    except Exception:
+        return {"issues": ["تعذر تحليل الرسالة. اكتب البيانات بوضوح في رسالة واحدة."]}
+
+
+async def rank_listing_ids(query: str, listings: list[dict]) -> list[int]:
+    if not listings:
+        return []
+    try:
+        compact = [{"id": x["id"], "title": x["title"], "description": x.get("description", ""), "category": x.get("category", "")} for x in listings]
+        resp = await client().chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": "رتب الإعلانات حسب مطابقتها لبحث المستخدم. أعد JSON فقط بالشكل {\"ids\":[أرقام]}. لا تضف أرقامًا غير موجودة."},
+                {"role": "user", "content": json.dumps({"query": query, "listings": compact}, ensure_ascii=False)},
+            ],
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+        ids = json.loads(resp.choices[0].message.content or "{}").get("ids", [])
+        valid = {x["id"] for x in listings}
+        return [int(x) for x in ids if str(x).isdigit() and int(x) in valid]
+    except Exception:
+        words = set(query.lower().split())
+        scored = sorted(listings, key=lambda x: len(words & set((x["title"] + " " + (x["description"] or "")).lower().split())), reverse=True)
+        return [x["id"] for x in scored]
