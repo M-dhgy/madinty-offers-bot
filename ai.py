@@ -88,3 +88,29 @@ async def generate_ad_copy(data: dict) -> str:
         return content or "تعذر إنشاء نص الإعلان. الرجاء المحاولة مرة أخرى."
     except Exception:
         return "تعذر إنشاء نص الإعلان مؤقتاً. الرجاء المحاولة مرة أخرى."
+
+
+LISTING_REVIEW_PROMPT = """
+أنت مراجع إعلانات عربية لسوق أفراد محلي. أعد JSON فقط:
+{"title":"عنوان محسن أو نفس العنوان","description":"وصف محسن دون اختراع معلومات","issues":[]}
+تحقق من وضوح الصنف والوصف والعنوان والسعر والتواصل والتوصيل. لا تحكم على السعر بأنه غالٍ أو رخيص.
+إذا كانت البيانات واضحة اجعل issues قائمة فارغة. لا تضف روابط أو أرقامًا غير موجودة.
+"""
+
+
+async def review_listing(data: dict) -> dict:
+    try:
+        resp = await client().chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": LISTING_REVIEW_PROMPT},
+                {"role": "user", "content": json.dumps(data, ensure_ascii=False)},
+            ],
+            temperature=0.1,
+            response_format={"type": "json_object"},
+        )
+        result = json.loads(resp.choices[0].message.content or "{}")
+        return result if isinstance(result, dict) else {"issues": []}
+    except Exception:
+        # لا نمنع المستخدم من النشر عند تعذر خدمة الذكاء؛ الإدارة تراجع الإعلان.
+        return {"issues": [], "ai_unavailable": True}

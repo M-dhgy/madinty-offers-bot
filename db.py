@@ -29,6 +29,9 @@ async def init_pool():
             address TEXT,
             contact TEXT,
             delivery TEXT,
+            negotiable BOOLEAN NOT NULL DEFAULT FALSE,
+            image_file_ids TEXT[] NOT NULL DEFAULT '{}',
+            expires_at TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '72 hours'),
             status TEXT NOT NULL DEFAULT 'pending_review',
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -53,6 +56,9 @@ async def init_pool():
         ALTER TABLE listings ADD COLUMN IF NOT EXISTS address TEXT;
         ALTER TABLE listings ADD COLUMN IF NOT EXISTS contact TEXT;
         ALTER TABLE listings ADD COLUMN IF NOT EXISTS delivery TEXT;
+        ALTER TABLE listings ADD COLUMN IF NOT EXISTS negotiable BOOLEAN NOT NULL DEFAULT FALSE;
+        ALTER TABLE listings ADD COLUMN IF NOT EXISTS image_file_ids TEXT[] NOT NULL DEFAULT '{}';
+        ALTER TABLE listings ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '72 hours');
     """)
     return _pool
 
@@ -105,7 +111,8 @@ async def get_business(business_id: int):
 
 async def create_listing(user_id: int, title: str, description: str, price: str | None,
                          condition: str, city_id: int | None, category: str,
-                         address: str, contact: str, delivery: str):
+                         address: str, contact: str, delivery: str,
+                         negotiable: bool, image_file_ids: list[str]):
     parsed_price = None
     if price:
         try:
@@ -114,18 +121,19 @@ async def create_listing(user_id: int, title: str, description: str, price: str 
             parsed_price = None
     return await pool().fetchrow(
         """INSERT INTO listings
-           (user_id, title, description, price, condition, city_id, category, address, contact, delivery)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *""",
+           (user_id, title, description, price, condition, city_id, category, address, contact, delivery, negotiable, image_file_ids)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *""",
         user_id, title, description, parsed_price, condition, city_id, category,
-        address, contact, delivery,
+        address, contact, delivery, negotiable, image_file_ids[:2],
     )
 
 
 async def list_public_listings(city_id: int | None = None, category: str | None = None):
+    await expire_listings()
     query = """SELECT l.*, c.name AS city_name, u.telegram_id AS owner_telegram_id
                FROM listings l JOIN users u ON u.id=l.user_id
                LEFT JOIN cities c ON c.id=l.city_id
-               WHERE l.status='approved'"""
+               WHERE l.status='approved' AND l.expires_at > now()"""
     args = []
     if city_id:
         args.append(city_id)
@@ -138,6 +146,7 @@ async def list_public_listings(city_id: int | None = None, category: str | None 
 
 
 async def list_pending_listings():
+    await expire_listings()
     return await pool().fetch(
         """SELECT l.*, u.telegram_id, u.first_name, c.name AS city_name
            FROM listings l JOIN users u ON u.id=l.user_id
@@ -161,6 +170,36 @@ async def log_listing_event(listing_id: int, user_id: int | None, event_type: st
     await pool().execute(
         "INSERT INTO listing_events (listing_id, user_id, event_type) VALUES ($1,$2,$3)",
         listing_id, user_id, event_type,
+    )
+
+
+async def expire_listings():
+    await pool().execute(
+        "UPDATE listings SET status='expired', updated_at=now() "
+        "WHERE status IN ('approved','pending_review') AND expires_at <= now()"
+    )
+
+
+async def renew_listing(listing_id: int, user_id: int):
+    return await pool().fetchrow(
+        "UPDATE listings SET status='pending_review', expires_at=now()+interval '72 hours', updated_at=now() "
+        "WHERE id=$1 AND user_id=$2 AND status IN ('expired','approved') RETURNING *",
+        listing_id, user_id,
+    )
+
+
+async def list_user_listings(user_id: int):
+    await expire_listings()
+    return await pool().fetch(
+        "SELECT id, title, status, expires_at FROM listings WHERE user_id=$1 ORDER BY id DESC LIMIT 20",
+        user_id,
+    )
+
+
+async def mark_listing_sold(listing_id: int, user_id: int):
+    return await pool().fetchrow(
+        "UPDATE listings SET status='sold', updated_at=now() WHERE id=$1 AND user_id=$2 RETURNING *",
+        listing_id, user_id,
     )
 
 

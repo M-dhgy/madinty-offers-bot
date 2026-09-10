@@ -60,6 +60,7 @@ BATCH_DELAY_SECONDS = float(os.environ.get("BROADCAST_BATCH_DELAY", "1.5"))
 REDEEM_CODE = 10
 LISTING_TITLE, LISTING_DESCRIPTION, LISTING_PRICE, LISTING_CONDITION, LISTING_CITY, LISTING_CATEGORY = range(11, 17)
 LISTING_ADDRESS, LISTING_CONTACT, LISTING_DELIVERY = range(17, 20)
+LISTING_PHOTOS, LISTING_NEGOTIABLE = range(20, 22)
 
 BIZ_TYPES = ["مطعم / كافيه", "متجر", "مركز تجميل", "خدمات"]
 
@@ -257,9 +258,12 @@ async def admin_listings_callback(update: Update, context: ContextTypes.DEFAULT_
     await query.edit_message_text("📦 إعلانات الأفراد بانتظار المراجعة:")
     for row in rows:
         price = str(row["price"]) if row["price"] is not None else "عند التواصل"
+        for photo_id in (row["image_file_ids"] or [])[:2]:
+            await context.bot.send_photo(update.effective_user.id, photo_id)
         await query.message.reply_text(
             f"📦 الإعلان #{row['id']}\n{row['title']}\n"
-            f"السعر: {price}\nالعنوان: {row['address'] or 'غير محدد'}\n"
+            f"السعر: {price}\nالتفاوض: {'مسموح' if row['negotiable'] else 'غير مسموح'}\n"
+            f"العنوان: {row['address'] or 'غير محدد'}\n"
             f"التواصل: {row['contact'] or 'غير محدد'}\nالتوصيل: {row['delivery'] or 'غير محدد'}\n\n"
             f"{row['description'] or ''}",
             reply_markup=InlineKeyboardMarkup([[
@@ -890,6 +894,18 @@ async def customer_directory_callback(update: Update, context: ContextTypes.DEFA
 async def customer_market_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await query.edit_message_text(
+        "🛒 سوق الأفراد\n\nاختر ما تريد:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🛍️ شراء والبحث عن غرض", callback_data="market_buy")],
+            [InlineKeyboardButton("🏷️ بيع غرض", callback_data="listing_start")],
+        ]),
+    )
+
+
+async def customer_market_browse_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
     user = await db.get_user_by_telegram_id(update.effective_user.id)
     # سوق الأفراد عام؛ العنوان يكتبه المعلن داخل تفاصيل الإعلان.
     listings = await db.list_public_listings()
@@ -906,9 +922,12 @@ async def customer_market_callback(update: Update, context: ContextTypes.DEFAULT
     for listing in listings:
         if user:
             await db.log_listing_event(listing["id"], user["id"], "VIEW")
+        for photo_id in (listing["image_file_ids"] or [])[:2]:
+            await context.bot.send_photo(update.effective_user.id, photo_id)
         price = str(listing["price"]) if listing["price"] is not None else "السعر عند التواصل"
         await query.message.reply_text(
             f"📦 {listing['title']}\nالسعر: {price}\n"
+            f"التفاوض: {'مسموح' if listing['negotiable'] else 'غير مسموح'}\n"
             f"الحالة: {listing['condition'] or 'غير محددة'}\n"
             f"📍 العنوان: {listing['address'] or 'غير محدد'}\n"
             f"📞 التواصل: {listing['contact'] or 'غير محدد'}\n"
@@ -987,8 +1006,25 @@ async def listing_title_received(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("اكتب اسمًا بين 3 و120 حرفًا.")
         return LISTING_TITLE
     context.user_data["listing_title"] = title
-    await update.message.reply_text("اكتب وصف الغرض ومواصفاته وحالته بالتفصيل.")
-    return LISTING_DESCRIPTION
+    context.user_data["listing_photos"] = []
+    await update.message.reply_text("أرسل صورة الغرض (بحد أقصى صورتين)، أو اكتب: بدون صورة")
+    return LISTING_PHOTOS
+
+
+async def listing_photo_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    photos = context.user_data.setdefault("listing_photos", [])
+    if update.message.photo and len(photos) < 2:
+        photos.append(update.message.photo[-1].file_id)
+        if len(photos) == 1:
+            await update.message.reply_text("تم حفظ الصورة الأولى. أرسل صورة ثانية أو اكتب: تم")
+            return LISTING_PHOTOS
+        await update.message.reply_text("تم حفظ صورتين. اكتب وصف الغرض ومواصفاته بالتفصيل.")
+        return LISTING_DESCRIPTION
+    if (update.message.text or "").strip() in {"بدون صورة", "تم"}:
+        await update.message.reply_text("اكتب وصف الغرض ومواصفاته وحالته بالتفصيل.")
+        return LISTING_DESCRIPTION
+    await update.message.reply_text("أرسل صورة صحيحة أو اكتب: تم للمتابعة.")
+    return LISTING_PHOTOS
 
 
 async def listing_description_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1011,7 +1047,18 @@ async def listing_price_received(update: Update, context: ContextTypes.DEFAULT_T
             await update.message.reply_text("اكتب سعرًا صحيحًا أو اكتب: عند التواصل")
             return LISTING_PRICE
     context.user_data["listing_price"] = None if price in {"عند التواصل", "غير محدد"} else price
-    await update.message.reply_text("اختر حالة الغرض:", reply_markup=InlineKeyboardMarkup([
+    await update.message.reply_text("هل السعر قابل للتفاوض؟", reply_markup=InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ نعم", callback_data="listing_negotiable_yes"),
+        InlineKeyboardButton("❌ لا", callback_data="listing_negotiable_no"),
+    ]]))
+    return LISTING_NEGOTIABLE
+
+
+async def listing_negotiable_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["listing_negotiable"] = query.data.endswith("yes")
+    await query.edit_message_text("اختر حالة الغرض:", reply_markup=InlineKeyboardMarkup([
         [InlineKeyboardButton("جديد", callback_data="listing_condition_جديد")],
         [InlineKeyboardButton("مستعمل", callback_data="listing_condition_مستعمل")],
     ]))
@@ -1055,6 +1102,22 @@ async def listing_contact_received(update: Update, context: ContextTypes.DEFAULT
 async def listing_delivery_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = context.user_data["db_user_id"]
     delivery = (update.message.text or "").strip()[:160]
+    review = await ai.review_listing({
+        "title": context.user_data["listing_title"],
+        "description": context.user_data["listing_description"],
+        "price": context.user_data.get("listing_price") or "عند التواصل",
+        "address": context.user_data["listing_address"],
+        "contact": context.user_data["listing_contact"],
+        "delivery": delivery,
+    })
+    issues = review.get("issues") or []
+    if issues:
+        await update.message.reply_text(
+            "⚠️ يحتاج الإعلان توضيحًا قبل إرساله للمراجعة:\n- " + "\n- ".join(map(str, issues))
+        )
+        return LISTING_DELIVERY
+    context.user_data["listing_title"] = review.get("title") or context.user_data["listing_title"]
+    context.user_data["listing_description"] = review.get("description") or context.user_data["listing_description"]
     listing = await db.create_listing(
         user_id,
         context.user_data["listing_title"],
@@ -1066,6 +1129,8 @@ async def listing_delivery_received(update: Update, context: ContextTypes.DEFAUL
         context.user_data["listing_address"],
         context.user_data["listing_contact"],
         delivery,
+        context.user_data.get("listing_negotiable", False),
+        context.user_data.get("listing_photos", []),
     )
     await update.message.reply_text(
         f"✅ تم استلام إعلانك رقم #{listing['id']} وأصبح قيد مراجعة الإدارة.\n"
@@ -1098,6 +1163,43 @@ async def cmd_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ تم استخدام الكود {row['code']} بنجاح.")
     else:
         await update.message.reply_text("❌ الكود غير صالح أو مستخدم مسبقاً.")
+
+
+async def cmd_my_listings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = await db.get_user_by_telegram_id(update.effective_user.id)
+    rows = await db.list_user_listings(user["id"]) if user else []
+    if not rows:
+        await update.message.reply_text("لا توجد إعلانات مرتبطة بحسابك.")
+        return
+    lines = ["📋 إعلاناتك:"]
+    for row in rows:
+        lines.append(f"#{row['id']} — {row['title']} — {row['status']}")
+    await update.message.reply_text("\n".join(lines) + "\n\nلتجديد إعلان: /renew رقم_الإعلان")
+
+
+async def cmd_renew_listing(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.message.reply_text("الاستخدام: /renew رقم_الإعلان")
+        return
+    user = await db.get_user_by_telegram_id(update.effective_user.id)
+    listing = await db.renew_listing(int(context.args[0]), user["id"]) if user else None
+    if listing:
+        await update.message.reply_text(
+            f"✅ تم تجديد الإعلان #{listing['id']} لمدة 72 ساعة وأصبح قيد مراجعة الإدارة مجددًا."
+        )
+    else:
+        await update.message.reply_text("لا يمكن تجديد هذا الإعلان أو أنه لا يخص حسابك.")
+
+
+async def cmd_sold_listing(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.message.reply_text("الاستخدام: /sold رقم_الإعلان")
+        return
+    user = await db.get_user_by_telegram_id(update.effective_user.id)
+    listing = await db.mark_listing_sold(int(context.args[0]), user["id"]) if user else None
+    await update.message.reply_text(
+        "✅ تم إيقاف الإعلان لأنه تم البيع." if listing else "لا يمكن إيقاف هذا الإعلان أو أنه لا يخص حسابك."
+    )
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1155,6 +1257,7 @@ def build_application() -> Application:
                 CallbackQueryHandler(admin_listing_action, pattern=r"^listing_(approve|reject)_\d+$"),
                 CallbackQueryHandler(admin_send_callback, pattern=r"^admin_send_\d+$"),
                 CallbackQueryHandler(customer_market_callback, pattern="^customer_market$"),
+                CallbackQueryHandler(customer_market_browse_callback, pattern="^market_buy$"),
                 CallbackQueryHandler(role_router),
                 CallbackQueryHandler(listing_start, pattern="^listing_start$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, text_role_router),
@@ -1171,8 +1274,13 @@ def build_application() -> Application:
             ],
             REDEEM_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, merchant_redeem_code_received)],
             LISTING_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, listing_title_received)],
+            LISTING_PHOTOS: [
+                MessageHandler(filters.PHOTO, listing_photo_received),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, listing_photo_received),
+            ],
             LISTING_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, listing_description_received)],
             LISTING_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, listing_price_received)],
+            LISTING_NEGOTIABLE: [CallbackQueryHandler(listing_negotiable_received, pattern="^listing_negotiable_")],
             LISTING_CONDITION: [CallbackQueryHandler(listing_condition_received, pattern="^listing_condition_")],
             LISTING_CITY: [CallbackQueryHandler(listing_city_received, pattern="^listing_city_")],
             LISTING_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, listing_category_received)],
@@ -1191,6 +1299,9 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("pending", cmd_pending))
     application.add_handler(CommandHandler("report", cmd_report))
     application.add_handler(CommandHandler("redeem", cmd_redeem))
+    application.add_handler(CommandHandler("mylistings", cmd_my_listings))
+    application.add_handler(CommandHandler("renew", cmd_renew_listing))
+    application.add_handler(CommandHandler("sold", cmd_sold_listing))
     application.add_handler(
         MessageHandler(filters.Regex(r"^/approve_\d+$") | filters.Regex(r"^/reject_\d+$"), cmd_approve_reject)
     )
@@ -1208,6 +1319,7 @@ def build_application() -> Application:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, merchant_redeem_fallback_message))
     application.add_handler(CallbackQueryHandler(customer_directory_callback, pattern="^customer_directory$"))
     application.add_handler(CallbackQueryHandler(customer_market_callback, pattern="^customer_market$"))
+    application.add_handler(CallbackQueryHandler(customer_market_browse_callback, pattern="^market_buy$"))
     application.add_handler(CallbackQueryHandler(listing_contact_callback, pattern=r"^listing_contact_\d+$"))
     application.add_handler(CallbackQueryHandler(business_contact_callback, pattern=r"^business_contact_\d+$"))
     application.add_handler(CallbackQueryHandler(listing_start, pattern="^listing_start$"))

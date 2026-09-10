@@ -101,6 +101,9 @@ CREATE TABLE IF NOT EXISTS listings (
     address      TEXT,
     contact      TEXT,
     delivery     TEXT,
+    negotiable   BOOLEAN NOT NULL DEFAULT FALSE,
+    image_file_ids TEXT[] NOT NULL DEFAULT '{}',
+    expires_at   TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '72 hours'),
     status       TEXT NOT NULL DEFAULT 'pending_review',
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
