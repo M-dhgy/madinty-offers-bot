@@ -62,12 +62,8 @@ async def sell_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     missing = []
     required = {
         "اسم الغرض": parsed.get("title"),
-        "الوصف والحالة": parsed.get("description"),
-        "السعر": parsed.get("price"),
-        "تحديد نهائي أو قابل للتفاوض": parsed.get("negotiable"),
         "العنوان والموقع": parsed.get("address"),
         "رقم التواصل": parsed.get("contact"),
-        "التوصيل (اذكر لا إن لم يوجد)": parsed.get("delivery"),
     }
     for label, value in required.items():
         if value is None or value == "" or value == []:
@@ -93,11 +89,11 @@ async def sell_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["market_draft"] = {
         "title": reviewed.get("title") or parsed["title"],
         "description": reviewed.get("description") or parsed["description"],
-        "price": str(parsed["price"]),
+        "price": str(parsed.get("price") or "عند التواصل"),
         "negotiable": bool(parsed["negotiable"]),
         "address": parsed["address"],
         "contact": parsed["contact"],
-        "delivery": parsed["delivery"],
+        "delivery": parsed.get("delivery") or "غير محدد",
         "condition": parsed.get("condition") or "غير محددة",
         "category": parsed.get("category") or "عام",
         "photo_ids": [message.photo[-1].file_id],
