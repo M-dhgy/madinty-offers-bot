@@ -33,6 +33,7 @@ from telegram.ext import (
 
 import ai
 import db
+import marketplace
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -1396,10 +1397,8 @@ def build_application() -> Application:
                 CallbackQueryHandler(admin_campaign_action, pattern=r"^admin_(approve|reject)_\d+$"),
                 CallbackQueryHandler(admin_listing_action, pattern=r"^listing_(approve|reject)_\d+$"),
                 CallbackQueryHandler(admin_send_callback, pattern=r"^admin_send_\d+$"),
-                CallbackQueryHandler(customer_market_callback, pattern="^customer_market$"),
-                CallbackQueryHandler(customer_market_browse_callback, pattern="^market_buy$"),
+            CallbackQueryHandler(marketplace.market_menu, pattern="^customer_market$"),
                 CallbackQueryHandler(role_router),
-                CallbackQueryHandler(listing_start, pattern="^listing_start$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, text_role_router),
             ],
             CUST_CITY: [CallbackQueryHandler(customer_city_chosen, pattern="^city_")],
@@ -1431,6 +1430,7 @@ def build_application() -> Application:
             MARKET_QUERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, market_query_received)],
             CAMPAIGN_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, campaign_description_received)],
             CAMPAIGN_CONFIRM: [CallbackQueryHandler(campaign_confirm_router)],
+            **marketplace.states(),
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
@@ -1461,11 +1461,8 @@ def build_application() -> Application:
     application.add_handler(CallbackQueryHandler(merchant_redeem_prompt_fallback, pattern="^redeem_menu$"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, merchant_redeem_fallback_message))
     application.add_handler(CallbackQueryHandler(customer_directory_callback, pattern="^customer_directory$"))
-    application.add_handler(CallbackQueryHandler(customer_market_callback, pattern="^customer_market$"))
-    application.add_handler(CallbackQueryHandler(customer_market_browse_callback, pattern="^market_buy$"))
     application.add_handler(CallbackQueryHandler(listing_contact_callback, pattern=r"^listing_contact_\d+$"))
     application.add_handler(CallbackQueryHandler(business_contact_callback, pattern=r"^business_contact_\d+$"))
-    application.add_handler(CallbackQueryHandler(listing_start, pattern="^listing_start$"))
     application.add_error_handler(on_error)
 
     return application
