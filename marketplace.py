@@ -3,8 +3,8 @@
 One state machine owns marketplace interactions:
 market menu -> buy search OR sell photo+caption -> AI review -> confirmation.
 """
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, filters
-from telegram.ext import CallbackQueryHandler, ContextTypes, ConversationHandler, MessageHandler
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import CallbackQueryHandler, ContextTypes, ConversationHandler, MessageHandler, filters
 
 import ai
 import db
