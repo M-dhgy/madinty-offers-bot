@@ -295,10 +295,23 @@ async def admin_listing_action(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         owner = await db.get_user_by_id(listing["user_id"])
         if owner:
+            stats = await db.listing_report(listing_id)
+            if status == "approved":
+                notice = (
+                    f"✅ تم قبول إعلانك ونشره بنجاح.\n\n"
+                    f"📦 الإعلان: {listing['title']}\n🔢 الرقم: #{listing_id}\n"
+                    f"⏱ مدة الإعلان: 72 ساعة\n📅 تاريخ الانتهاء: {listing['expires_at']}\n\n"
+                    f"📊 المشاهدات: {stats['views']}\n📩 مرات التواصل: {stats['contacts']}\n\n"
+                    "يمكنك متابعة الإحصاءات عبر /stats رقم_الإعلان، وتجديده عبر /renew رقم_الإعلان."
+                )
+            else:
+                notice = (
+                    f"❌ لم تتم الموافقة على إعلانك رقم #{listing_id}.\n"
+                    "يمكنك تعديل البيانات وإرساله للمراجعة مرة أخرى."
+                )
             await context.bot.send_message(
                 owner["telegram_id"],
-                f"{'✅ تم اعتماد' if status == 'approved' else '❌ تم رفض'} إعلانك رقم #{listing_id}.\n"
-                + ("أصبح ظاهرًا الآن في سوق الأفراد." if status == "approved" else "يمكنك تعديل البيانات وإعادة المحاولة لاحقًا."),
+                notice,
             )
     except Exception as exc:  # noqa: BLE001
         log.warning("تعذر إشعار صاحب الإعلان %s: %s", listing_id, exc)
@@ -1272,8 +1285,36 @@ async def cmd_my_listings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     lines = ["📋 إعلاناتك:"]
     for row in rows:
-        lines.append(f"#{row['id']} — {row['title']} — {row['status']}")
-    await update.message.reply_text("\n".join(lines) + "\n\nلتجديد إعلان: /renew رقم_الإعلان")
+        stats = await db.listing_report(row["id"])
+        lines.append(
+            f"#{row['id']} — {row['title']} — {row['status']}\n"
+            f"المشاهدات: {stats['views']} | مشاهدون: {stats['unique_viewers']} | تواصل: {stats['contacts']}"
+        )
+    await update.message.reply_text(
+        "\n".join(lines) + "\n\nلتجديد إعلان: /renew رقم_الإعلان\n"
+        "لعرض تقرير إعلان محدد: /stats رقم_الإعلان"
+    )
+
+
+async def cmd_listing_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.message.reply_text("الاستخدام: /stats رقم_الإعلان")
+        return
+    user = await db.get_user_by_telegram_id(update.effective_user.id)
+    listing = await db.get_listing(int(context.args[0])) if user else None
+    if not listing or listing["user_id"] != user["id"]:
+        await update.message.reply_text("هذا الإعلان غير موجود أو لا يخص حسابك.")
+        return
+    stats = await db.listing_report(listing["id"])
+    await update.message.reply_text(
+        f"📊 إحصاءات الإعلان #{listing['id']}\n{listing['title']}\n\n"
+        f"المشاهدات: {stats['views']}\n"
+        f"المشاهدون الفريدون: {stats['unique_viewers']}\n"
+        f"مرات التواصل: {stats['contacts']}\n"
+        f"المتواصلون الفريدون: {stats['unique_contacts']}\n"
+        f"الحالة: {listing['status']}\n"
+        f"ينتهي في: {listing['expires_at']}"
+    )
 
 
 async def cmd_renew_listing(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1401,6 +1442,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("report", cmd_report))
     application.add_handler(CommandHandler("redeem", cmd_redeem))
     application.add_handler(CommandHandler("mylistings", cmd_my_listings))
+    application.add_handler(CommandHandler("stats", cmd_listing_stats))
     application.add_handler(CommandHandler("renew", cmd_renew_listing))
     application.add_handler(CommandHandler("sold", cmd_sold_listing))
     application.add_handler(

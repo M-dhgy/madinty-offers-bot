@@ -167,6 +167,19 @@ async def set_listing_status(listing_id: int, status: str):
 
 
 async def log_listing_event(listing_id: int, user_id: int | None, event_type: str):
+    if event_type == "VIEW" and user_id is not None:
+        # لا نحتسب إعادة ظهور الإعلان للمستخدم نفسه أكثر من مرة في اليوم.
+        await pool().execute(
+            """INSERT INTO listing_events (listing_id, user_id, event_type)
+               SELECT $1,$2,$3
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM listing_events
+                 WHERE listing_id=$1 AND user_id=$2 AND event_type=$3
+                   AND created_at >= current_date
+               )""",
+            listing_id, user_id, event_type,
+        )
+        return
     await pool().execute(
         "INSERT INTO listing_events (listing_id, user_id, event_type) VALUES ($1,$2,$3)",
         listing_id, user_id, event_type,
@@ -204,11 +217,16 @@ async def mark_listing_sold(listing_id: int, user_id: int):
 
 
 async def listing_report(listing_id: int):
-    rows = await pool().fetch(
-        "SELECT event_type, COUNT(*) AS count FROM listing_events WHERE listing_id=$1 GROUP BY event_type",
+    rows = await pool().fetchrow(
+        """SELECT
+           COUNT(*) FILTER (WHERE event_type='VIEW') AS views,
+           COUNT(DISTINCT user_id) FILTER (WHERE event_type='VIEW' AND user_id IS NOT NULL) AS unique_viewers,
+           COUNT(*) FILTER (WHERE event_type='CONTACT') AS contacts,
+           COUNT(DISTINCT user_id) FILTER (WHERE event_type='CONTACT' AND user_id IS NOT NULL) AS unique_contacts
+           FROM listing_events WHERE listing_id=$1""",
         listing_id,
     )
-    return {row["event_type"].lower(): row["count"] for row in rows}
+    return dict(rows) if rows else {"views": 0, "unique_viewers": 0, "contacts": 0, "unique_contacts": 0}
 
 
 async def log_business_event(business_id: int, user_id: int | None, event_type: str):
@@ -219,11 +237,16 @@ async def log_business_event(business_id: int, user_id: int | None, event_type: 
 
 
 async def business_report(business_id: int):
-    rows = await pool().fetch(
-        "SELECT event_type, COUNT(*) AS count FROM business_events WHERE business_id=$1 GROUP BY event_type",
+    row = await pool().fetchrow(
+        """SELECT
+           COUNT(*) FILTER (WHERE event_type='VIEW') AS views,
+           COUNT(DISTINCT user_id) FILTER (WHERE event_type='VIEW' AND user_id IS NOT NULL) AS unique_viewers,
+           COUNT(*) FILTER (WHERE event_type='CONTACT') AS contacts,
+           COUNT(DISTINCT user_id) FILTER (WHERE event_type='CONTACT' AND user_id IS NOT NULL) AS unique_contacts
+           FROM business_events WHERE business_id=$1""",
         business_id,
     )
-    return {row["event_type"].lower(): row["count"] for row in rows}
+    return dict(row) if row else {"views": 0, "unique_viewers": 0, "contacts": 0, "unique_contacts": 0}
 
 
 # ---------------------------------------------------------------
