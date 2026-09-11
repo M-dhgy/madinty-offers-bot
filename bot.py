@@ -129,12 +129,13 @@ async def text_role_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return SELECT_ROLE
     if text == "🛒 سوق الأفراد":
         await update.message.reply_text(
-            "🛒 سوق الأفراد — النشر مجاني خلال فترة الإطلاق.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("➕ نشر غرض للبيع", callback_data="listing_start")
-            ]]),
+            "🛒 سوق الأفراد\n\nاختر العملية المطلوبة:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🛍️ شراء", callback_data="market_buy")],
+                [InlineKeyboardButton("🏷️ بيع", callback_data="market_sell")],
+            ]),
         )
-        return SELECT_ROLE
+        return marketplace.MARKET_MENU
     return SELECT_ROLE
 
 
@@ -1387,7 +1388,6 @@ def build_application() -> Application:
     conv = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
-            CallbackQueryHandler(listing_start, pattern="^listing_start$"),
         ],
         states={
             SELECT_ROLE: [
