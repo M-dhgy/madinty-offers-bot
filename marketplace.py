@@ -1,245 +1,247 @@
-"""Clean individual marketplace flow for Madinty Offers.
-
-One state machine owns marketplace interactions:
-market menu -> buy search OR sell photo+caption -> AI review -> confirmation.
 """
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import CallbackQueryHandler, ContextTypes, ConversationHandler, MessageHandler, filters
+ai.py — طبقة الذكاء الاصطناعي
+v0.2:
+  • إضافة match_city لمطابقة اسم مدينة كتبها المستخدم بالعربي.
+  • باقي الدوال كما هي (استخراج حملة، توليد إعلان، مراجعة إعلان، تصنيف نتائج).
+"""
 
-import ai
-import db
+import json
+import os
+from openai import AsyncOpenAI
 
-MARKET_MENU, SELL_MESSAGE, SELL_CONFIRM, BUY_QUERY = range(40, 44)
-
-
-def _user_id(context):
-    return context.user_data.get("db_user_id")
-
-
-async def market_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(
-        "🛒 سوق الأفراد\n\nاختر العملية المطلوبة:",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🛍️ شراء", callback_data="market_buy")],
-            [InlineKeyboardButton("🏷️ بيع", callback_data="market_sell")],
-        ]),
-    )
-    return MARKET_MENU
+_client: AsyncOpenAI | None = None
 
 
-async def sell_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(
-        "🏷️ نشر غرض للبيع\n\n"
-        "أرسل صورة الغرض مع كتابة جميع التفاصيل في شرح الصورة في رسالة واحدة.\n\n"
-        "المعلومات المطلوبة:\n"
-        "• اسم الغرض ووصفه وحالته\n"
-        "• السعر\n"
-        "• هل السعر نهائي أم قابل للتفاوض؟\n"
-        "• العنوان ومكان وجود الغرض أو البائع\n"
-        "• رقم التواصل\n"
-        "• هل توجد خدمة توصيل؟\n\n"
-        "مسموح بصورة أو صورتين، ولن يُرسل الإعلان للإدارة قبل اكتمال البيانات.\n\n"
-        "مثال على شرح الصورة:\n"
-        "هاتف Samsung A54 مستعمل بحالة ممتازة. السعر 800000 جنيه، "
-        "قابل للتفاوض. الموقع: بحري السوق العربي. التواصل: 09xxxxxxxx. "
-        "التوصيل: لا توجد خدمة توصيل.\n\n"
-        "📷 أرسل الصورة الآن مع النص في نفس الرسالة."
-    )
-    return SELL_MESSAGE
+def _model() -> str:
+    # تُقرأ عند الطلب — بعد تحميل .env في bot.py
+    return os.environ.get("GROQ_MODEL") or "openai/gpt-oss-120b"
 
 
-async def sell_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    if not message.photo or not (message.caption or "").strip():
-        await message.reply_text("⚠️ أرسل صورة الغرض مع جميع التفاصيل في شرح الصورة في رسالة واحدة.")
-        return SELL_MESSAGE
+def _base_url() -> str:
+    return os.environ.get("GROQ_BASE_URL") or "https://api.groq.com/openai/v1"
 
-    parsed = await ai.extract_listing_data(message.caption.strip())
-    missing = []
-    required = {
-        "اسم الغرض": parsed.get("title"),
-        "العنوان والموقع": parsed.get("address"),
-        "رقم التواصل": parsed.get("contact"),
-    }
-    for label, value in required.items():
-        if value is None or value == "" or value == []:
-            missing.append(label)
-    missing.extend(str(x) for x in (parsed.get("issues") or []))
-    if missing:
-        await message.reply_text(
-            "⚠️ لا يمكن إرسال الإعلان بعد.\n\nالبيانات الناقصة أو غير الواضحة:\n- "
-            + "\n- ".join(dict.fromkeys(missing))
-            + "\n\nأرسل صورة جديدة مع التفاصيل كاملة في رسالة واحدة."
+
+def client() -> AsyncOpenAI:
+    global _client
+    if _client is None:
+        _client = AsyncOpenAI(
+            api_key=os.environ["GROQ_API_KEY"],
+            base_url=_base_url(),
+            timeout=float(os.environ.get("AI_TIMEOUT_SECONDS") or "45"),
+            max_retries=2,
         )
-        return SELL_MESSAGE
+    return _client
 
-    reviewed = await ai.review_listing(parsed)
-    if reviewed.get("issues"):
-        await message.reply_text(
-            "⚠️ يحتاج الإعلان إلى توضيح:\n- "
-            + "\n- ".join(map(str, reviewed["issues"]))
-            + "\n\nأرسل الصورة مع التفاصيل المصححة."
+
+# ---------------------------------------------------------------
+# City matching
+# ---------------------------------------------------------------
+async def match_city(user_text: str, cities: list[dict]) -> int | None:
+    """يطابق اسم مدينة كتبه المستخدم مع قائمة المدن المتاحة. يعيد city_id أو None."""
+    if not cities or not user_text:
+        return None
+
+    compact = [{"id": c["id"], "name": c["name"], "code": c["code"]} for c in cities]
+    try:
+        resp = await client().chat.completions.create(
+            model=_model(),
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "طابق نص المستخدم مع مدينة واحدة من القائمة. "
+                        'أعد JSON فقط بالشكل {"id": رقم_المدينة أو null}. '
+                        "لا تخترع أرقامًا غير موجودة. إذا لم تتأكد أعِد null."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {"query": user_text, "cities": compact},
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            temperature=0,
+            response_format={"type": "json_object"},
         )
-        return SELL_MESSAGE
-
-    context.user_data["market_draft"] = {
-        "title": reviewed.get("title") or parsed["title"],
-        "description": reviewed.get("description") or parsed["description"],
-        "price": str(parsed.get("price") or "عند التواصل"),
-        "negotiable": bool(parsed["negotiable"]),
-        "address": parsed["address"],
-        "contact": parsed["contact"],
-        "delivery": parsed.get("delivery") or "غير محدد",
-        "condition": parsed.get("condition") or "غير محددة",
-        "category": parsed.get("category") or "عام",
-        "photo_ids": [message.photo[-1].file_id],
-    }
-    draft = context.user_data["market_draft"]
-    price = draft["price"]
-    await message.reply_text(
-        "راجع إعلانك قبل إرساله:\n\n"
-        f"📦 {draft['title']}\n📝 {draft['description']}\n"
-        f"💰 السعر: {price}\n🔄 التفاوض: {'قابل للتفاوض' if draft['negotiable'] else 'نهائي'}\n"
-        f"📍 {draft['address']}\n📞 {draft['contact']}\n🚚 {draft['delivery']}\n\n"
-        "مدة الإعلان بعد الاعتماد: 72 ساعة. ويمكن تجديده قبل انتهائه.",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ إرسال للمراجعة", callback_data="market_submit")],
-            [InlineKeyboardButton("✏️ إعادة الإرسال", callback_data="market_resend"),
-             InlineKeyboardButton("❌ إلغاء", callback_data="market_cancel")],
-        ]),
-    )
-    return SELL_CONFIRM
+        data = json.loads(resp.choices[0].message.content or "{}")
+        cid = data.get("id")
+        if cid is None:
+            return None
+        cid_int = int(cid)
+        return cid_int if cid_int in {c["id"] for c in cities} else None
+    except Exception:
+        # fallback: مطابقة نصية بسيطة
+        text = user_text.strip().lower()
+        for c in cities:
+            name = c["name"].lower()
+            code = c["code"].lower()
+            if text in name or name in text or text in code:
+                return c["id"]
+        return None
 
 
-async def sell_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "market_cancel":
-        context.user_data.pop("market_draft", None)
-        await query.edit_message_text("تم إلغاء إنشاء الإعلان.")
-        return ConversationHandler.END
-    if query.data == "market_resend":
-        context.user_data.pop("market_draft", None)
-        await query.edit_message_text("أرسل صورة الغرض مع جميع التفاصيل في شرح الصورة برسالة واحدة.")
-        return SELL_MESSAGE
-    draft = context.user_data.get("market_draft")
-    if not draft:
-        await query.edit_message_text("انتهت جلسة الإعلان. ابدأ من سوق الأفراد مرة أخرى.")
-        return ConversationHandler.END
-    listing = await db.create_listing(
-        _user_id(context), draft["title"], draft["description"], draft["price"],
-        draft["condition"], None, draft["category"], draft["address"],
-        draft["contact"], draft["delivery"], draft["negotiable"], draft["photo_ids"],
-    )
-    context.user_data.pop("market_draft", None)
-    await query.edit_message_text(
-        f"✅ تم إرسال الإعلان #{listing['id']} إلى الإدارة للمراجعة.\n"
-        "سيصلك إشعار عند القبول أو الرفض. النشر مجاني خلال فترة الإطلاق."
-    )
-    return ConversationHandler.END
+# ---------------------------------------------------------------
+# Campaign — extraction + ad copy
+# ---------------------------------------------------------------
+EXTRACTION_SYSTEM_PROMPT = """
+أنت مساعد يستخرج بيانات منظمة من وصف عرض تجاري مكتوب بالعامية أو الفصحى.
+أعد **فقط** كائن JSON بالحقول التالية ولا شيء غيره:
+{
+  "business_type": "restaurant|shop|beauty|service|other",
+  "category_code": "FOOD|SHOPPING|BEAUTY|SERVICES",
+  "city_code": "KHARTOUM|OMDURMAN|BAHRI|UNKNOWN",
+  "discount": <رقم أو null>,
+  "target": "وصف قصير للجمهور المستهدف",
+  "title": "عنوان قصير للحملة",
+  "start": "YYYY-MM-DD أو null",
+  "end": "YYYY-MM-DD أو null",
+  "issues": ["أي معلومة ناقصة أو غير منطقية أو مخالفة"]
+}
+لا تكتب أي نص خارج كائن الـ JSON.
+"""
+
+AD_COPY_SYSTEM_PROMPT = """
+أنت كاتب إعلانات تسويقية بالعربية لمنصة عروض محلية على Telegram.
+اكتب إعلاناً قصيراً (3-5 أسطر) جذاباً بناءً على البيانات المعطاة،
+مع إيموجي مناسب باعتدال، وادعُ القارئ في النهاية للحصول على كود الخصم عبر البوت.
+لا تخترع تفاصيل غير موجودة في البيانات.
+"""
 
 
-async def buy_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(
-        "🛍️ البحث في سوق الأفراد\n\n"
-        "اكتب ما تبحث عنه بكلمة أو جملة مختصرة.\n"
-        "مثال: هاتف آيفون مستعمل أو تلفاز 50 بوصة بسعر مناسب"
-    )
-    return BUY_QUERY
-
-
-async def buy_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    if len(text) < 2:
-        await update.message.reply_text("اكتب كلمة أو جملة أوضح لما تبحث عنه.")
-        return BUY_QUERY
-    listings = await db.list_public_listings()
-    ranked = await ai.rank_listing_ids(text, listings)
-    lookup = {row["id"]: row for row in listings}
-    ids = [x for x in ranked if x in lookup]
-    matches = [lookup[x] for x in ids[:5]]
-    if not matches:
-        await update.message.reply_text("لم نجد إعلانًا مطابقًا حاليًا.")
-        return ConversationHandler.END
-    context.user_data["market_results"] = ids
-    context.user_data["market_offset"] = 5
-    await update.message.reply_text(f"✅ أفضل {len(matches)} إعلانات مطابقة:")
-    await _send_results(update, context, matches)
-    buttons = []
-    if len(ids) > 5:
-        buttons.append([InlineKeyboardButton("📄 المزيد من الإعلانات", callback_data="market_more")])
-    buttons.append([InlineKeyboardButton("🔎 بحث جديد", callback_data="market_new_search")])
-    await update.message.reply_text("اختر إجراءً:", reply_markup=InlineKeyboardMarkup(buttons))
-    return MARKET_MENU
-
-
-async def more_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    ids = context.user_data.get("market_results", [])
-    offset = context.user_data.get("market_offset", 5)
-    rows = await db.list_public_listings()
-    lookup = {row["id"]: row for row in rows}
-    matches = [lookup[x] for x in ids[offset:offset + 5] if x in lookup]
-    if not matches:
-        await query.edit_message_text("لا توجد إعلانات إضافية مطابقة.")
-        return MARKET_MENU
-    await query.edit_message_text("📄 إعلانات إضافية مطابقة:")
-    await _send_results(update, context, matches)
-    context.user_data["market_offset"] = offset + 5
-    return MARKET_MENU
-
-
-async def new_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("اكتب ما تبحث عنه بكلمة أو جملة مختصرة.")
-    return BUY_QUERY
-
-
-async def _send_results(update, context, rows):
-    user_id = _user_id(context)
-    for row in rows:
-        await db.log_listing_event(row["id"], user_id, "VIEW")
-        target = update.effective_chat.id
-        for photo_id in (row["image_file_ids"] or [])[:2]:
-            await context.bot.send_photo(target, photo_id)
-        price = str(row["price"]) if row["price"] is not None else "عند التواصل"
-        await context.bot.send_message(
-            target,
-            f"📦 {row['title']}\n💰 السعر: {price}\n"
-            f"🔄 التفاوض: {'مسموح' if row['negotiable'] else 'غير مسموح'}\n"
-            f"📍 {row['address'] or 'غير محدد'}\n🚚 {row['delivery'] or 'غير محدد'}\n"
-            f"{row['description'] or ''}",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("📩 تواصل مع المعلن", callback_data=f"listing_contact_{row['id']}"),
-            ]]),
+async def extract_campaign_data(raw_text: str) -> dict:
+    try:
+        resp = await client().chat.completions.create(
+            model=_model(),
+            messages=[
+                {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+                {"role": "user", "content": raw_text},
+            ],
+            temperature=0.2,
+            response_format={"type": "json_object"},
         )
+        content = resp.choices[0].message.content or ""
+        data = json.loads(content)
+        return data if isinstance(data, dict) else {"issues": ["استجابة الذكاء الاصطناعي غير صالحة."]}
+    except (json.JSONDecodeError, IndexError, TypeError, ValueError) as exc:
+        return {"issues": ["تعذر تحليل النص، الرجاء إعادة الصياغة بشكل أوضح."], "error": str(exc)}
+    except Exception:
+        return {"issues": ["تعذر تحليل النص، الرجاء إعادة الصياغة بشكل أوضح."]}
 
 
-def states():
-    return {
-        MARKET_MENU: [
-            CallbackQueryHandler(buy_start, pattern="^market_buy$"),
-            CallbackQueryHandler(sell_start, pattern="^market_sell$"),
-            CallbackQueryHandler(more_results, pattern="^market_more$"),
-            CallbackQueryHandler(new_search, pattern="^market_new_search$"),
-        ],
-        SELL_MESSAGE: [
-            MessageHandler(filters.PHOTO, sell_message),
-            MessageHandler(filters.ALL & ~filters.COMMAND, sell_message),
-        ],
-        SELL_CONFIRM: [CallbackQueryHandler(sell_confirm, pattern="^market_(submit|resend|cancel)$")],
-        BUY_QUERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, buy_query)],
-    }
+async def generate_ad_copy(data: dict) -> str:
+    try:
+        resp = await client().chat.completions.create(
+            model=_model(),
+            messages=[
+                {"role": "system", "content": AD_COPY_SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps(data, ensure_ascii=False)},
+            ],
+            temperature=0.7,
+        )
+        content = (resp.choices[0].message.content or "").strip()
+        return content or "تعذر إنشاء نص الإعلان. الرجاء المحاولة مرة أخرى."
+    except Exception:
+        return "تعذر إنشاء نص الإعلان مؤقتاً. الرجاء المحاولة مرة أخرى."
 
 
-def handlers():
-    from telegram.ext import CallbackQueryHandler
-    return [CallbackQueryHandler(market_menu, pattern="^customer_market$")]
+# ---------------------------------------------------------------
+# Listing — review + extraction + ranking
+# ---------------------------------------------------------------
+LISTING_REVIEW_PROMPT = """
+أنت مراجع إعلانات عربية لسوق أفراد محلي. أعد JSON فقط:
+{"title":"عنوان محسن أو نفس العنوان","description":"وصف محسن دون اختراع معلومات","issues":[]}
+تحقق إلزاميًا فقط من وجود اسم الصنف والعنوان أو مكان التواجد ورقم التواصل. الصورة يجري التحقق منها خارج المراجعة.
+الوصف والسعر والتفاوض والحالة والتوصيل اختيارية، فلا تضعها في issues إذا غابت. لا تحكم على السعر بأنه غالٍ أو رخيص.
+إذا كانت الحقول الإلزامية واضحة اجعل issues قائمة فارغة. لا تضف روابط أو أرقامًا غير موجودة.
+"""
+
+
+async def review_listing(data: dict) -> dict:
+    try:
+        resp = await client().chat.completions.create(
+            model=_model(),
+            messages=[
+                {"role": "system", "content": LISTING_REVIEW_PROMPT},
+                {"role": "user", "content": json.dumps(data, ensure_ascii=False)},
+            ],
+            temperature=0.1,
+            response_format={"type": "json_object"},
+        )
+        result = json.loads(resp.choices[0].message.content or "{}")
+        return result if isinstance(result, dict) else {"issues": []}
+    except Exception:
+        return {"issues": [], "ai_unavailable": True}
+
+
+LISTING_PARSE_PROMPT = """
+استخرج من رسالة بائع عربية بيانات إعلان فردي. أعد JSON فقط:
+{"title":"","description":"","price":"","negotiable":true,"address":"","contact":"","delivery":"","condition":"جديد أو مستعمل","category":"","issues":[]}
+الحقول الإلزامية التي يجب فحصها فقط هي: اسم المنتج title، رقم التواصل contact، ومكان التواجد أو العنوان address.
+الصورة إلزامية ويجري التحقق منها خارج هذا التحليل، فيجب عدم اعتبار غيابها من النص مشكلة.
+كل الحقول الأخرى اختيارية: الوصف، السعر، التفاوض، الحالة، التصنيف، والتوصيل.
+إذا غاب أحد الحقول الإلزامية الثلاثة من النص، اذكره بوضوح داخل issues باللغة العربية.
+لا تخترع أي معلومة. اترك الحقول الاختيارية فارغة أو null إذا لم تذكر.
+"""
+
+
+async def extract_listing_data(raw_text: str) -> dict:
+    try:
+        resp = await client().chat.completions.create(
+            model=_model(),
+            messages=[
+                {"role": "system", "content": LISTING_PARSE_PROMPT},
+                {"role": "user", "content": raw_text},
+            ],
+            temperature=0.1,
+            response_format={"type": "json_object"},
+        )
+        result = json.loads(resp.choices[0].message.content or "{}")
+        return result if isinstance(result, dict) else {"issues": ["تعذر قراءة البيانات."]}
+    except Exception:
+        return {"issues": ["تعذر تحليل الرسالة. اكتب البيانات بوضوح في رسالة واحدة."]}
+
+
+async def rank_listing_ids(query: str, listings: list[dict]) -> list[int]:
+    if not listings:
+        return []
+    try:
+        compact = [
+            {"id": x["id"], "title": x["title"],
+             "description": x.get("description", ""),
+             "category": x.get("category", "")}
+            for x in listings
+        ]
+        resp = await client().chat.completions.create(
+            model=_model(),
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        'رتب الإعلانات حسب مطابقتها لبحث المستخدم. '
+                        'أعد JSON فقط بالشكل {"ids":[أرقام]}. لا تضف أرقامًا غير موجودة.'
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {"query": query, "listings": compact},
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+        ids = json.loads(resp.choices[0].message.content or "{}").get("ids", [])
+        valid = {x["id"] for x in listings}
+        return [int(x) for x in ids if str(x).isdigit() and int(x) in valid]
+    except Exception:
+        words = set(query.lower().split())
+        scored = sorted(
+            listings,
+            key=lambda x: len(words & set((x["title"] + " " + (x["description"] or "")).lower().split())),
+            reverse=True,
+        )
+        return [x["id"] for x in scored]
