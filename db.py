@@ -25,6 +25,7 @@ async def init_pool():
     await _pool.execute("""
         ALTER TABLE businesses ADD COLUMN IF NOT EXISTS is_paid BOOLEAN NOT NULL DEFAULT FALSE;
         ALTER TABLE discount_codes ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+        ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS broadcast_started_at TIMESTAMPTZ;
 
         CREATE INDEX IF NOT EXISTS idx_businesses_status ON businesses(status);
         CREATE INDEX IF NOT EXISTS idx_businesses_city   ON businesses(city_id);
@@ -188,11 +189,10 @@ async def get_business_by_user(user_id: int):
 
 async def create_business(user_id: int, name: str, business_type: str,
                           city_id: int, phone: str, is_paid: bool = False):
-    status = "approved" if is_paid else "pending"
     return await pool().fetchrow(
         """INSERT INTO businesses (user_id, business_name, business_type, city_id, phone, is_paid, status)
-           VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *""",
-        user_id, name, business_type, city_id, phone, is_paid, status,
+           VALUES ($1,$2,$3,$4,$5,$6,'pending') RETURNING *""",
+        user_id, name, business_type, city_id, phone, is_paid,
     )
 
 
@@ -215,8 +215,10 @@ async def list_pending_businesses():
 
 
 async def set_business_status(business_id: int, status: str):
+    if status not in {"approved", "rejected"}:
+        raise ValueError("Business review status must be approved or rejected")
     return await pool().fetchrow(
-        "UPDATE businesses SET status=$1 WHERE id=$2 RETURNING *",
+        "UPDATE businesses SET status=$1 WHERE id=$2 AND status='pending' RETURNING *",
         status, business_id,
     )
 
@@ -392,7 +394,11 @@ async def create_campaign(business_id: int, raw_input: str, ai_data: dict, ad_te
         """INSERT INTO campaigns
              (business_id, title, description, raw_input, category_id, city_id,
               target_audience, discount_percent, status)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending_review')
+           SELECT b.id, $2, $3, $4, ca.id, ci.id, $7, $8, 'pending_review'
+           FROM businesses b
+           JOIN cities ci ON ci.id=$6 AND ci.status='active'
+           JOIN categories ca ON ca.id=$5 AND ca.status='active'
+           WHERE b.id=$1 AND b.status='approved' AND b.city_id=ci.id
            RETURNING *""",
         business_id,
         ai_data.get("title") or ad_text[:60],
@@ -413,51 +419,101 @@ async def list_pending_campaigns():
     return await pool().fetch(
         """SELECT c.*, b.business_name FROM campaigns c
            JOIN businesses b ON b.id = c.business_id
-           WHERE c.status='pending_review' ORDER BY c.id"""
+           WHERE c.status='pending_review' AND b.status='approved' ORDER BY c.id"""
     )
 
 
-async def set_campaign_status(campaign_id: int, status: str):
-    if status == "approved":
-        await pool().execute(
-            "UPDATE campaigns SET status=$1, approved_at=now() WHERE id=$2", status, campaign_id)
-    else:
-        await pool().execute("UPDATE campaigns SET status=$1 WHERE id=$2", status, campaign_id)
+async def review_campaign(campaign_id: int, action: str):
+    if action == "reject":
+        return await pool().fetchrow(
+            "UPDATE campaigns SET status='rejected' WHERE id=$1 AND status='pending_review' RETURNING *",
+            campaign_id,
+        )
+    if action != "approve":
+        raise ValueError("Campaign review action must be approve or reject")
+    return await pool().fetchrow(
+        """UPDATE campaigns c SET status='approved', approved_at=now()
+           FROM businesses b, cities ci, categories ca
+           WHERE c.id=$1 AND c.status='pending_review'
+             AND b.id=c.business_id AND b.status='approved'
+             AND ci.id=c.city_id AND ci.status='active' AND b.city_id=ci.id
+             AND ca.id=c.category_id AND ca.status='active'
+           RETURNING c.*""",
+        campaign_id,
+    )
 
 
-async def mark_campaign_published(campaign_id: int):
-    await pool().execute(
-        "UPDATE campaigns SET status='active', published_at=now() WHERE id=$1", campaign_id)
+async def validate_campaign_target(business_id: int, city_id: int | None, category_id: int | None) -> bool:
+    """Require an approved merchant, its registered active city, and an active category."""
+    if type(city_id) is not int or city_id <= 0 or type(category_id) is not int or category_id <= 0:
+        return False
+    return bool(await pool().fetchval(
+        """SELECT EXISTS (
+             SELECT 1 FROM businesses b
+             JOIN cities ci ON ci.id=$2 AND ci.status='active'
+             JOIN categories ca ON ca.id=$3 AND ca.status='active'
+             WHERE b.id=$1 AND b.status='approved' AND b.city_id=ci.id
+           )""",
+        business_id, city_id, category_id,
+    ))
+
+
+async def claim_campaign_for_broadcast(campaign_id: int):
+    """Atomically move an eligible approved campaign to sending (one claim only)."""
+    return await pool().fetchrow(
+        """UPDATE campaigns c SET status='sending', broadcast_started_at=now()
+           FROM businesses b, cities ci, categories ca
+           WHERE c.id=$1 AND c.status='approved'
+             AND b.id=c.business_id AND b.status='approved'
+             AND ci.id=c.city_id AND ci.status='active' AND b.city_id=ci.id
+             AND ca.id=c.category_id AND ca.status='active'
+           RETURNING c.*""",
+        campaign_id,
+    )
+
+
+async def finish_campaign_broadcast(campaign_id: int, succeeded: bool):
+    """Finalize a claimed campaign; failed attempts are not silently retryable."""
+    status = "active" if succeeded else "broadcast_failed"
+    return await pool().fetchrow(
+        """UPDATE campaigns SET status=$2, published_at=CASE WHEN $2='active' THEN now() ELSE published_at END
+           WHERE id=$1 AND status='sending' RETURNING *""",
+        campaign_id, status,
+    )
+
+
+async def release_campaign_without_delivery(campaign_id: int):
+    """Return an untouched campaign to approved when there were no recipients."""
+    return await pool().fetchrow(
+        "UPDATE campaigns SET status='approved', broadcast_started_at=NULL WHERE id=$1 AND status='sending' RETURNING *",
+        campaign_id,
+    )
 
 
 async def find_target_users(city_id: int | None, category_id: int | None):
-    """المستخدمون المطابقون. إذا كان كلا المعيارين None → لا أحد (حماية)."""
-    if city_id is None and category_id is None:
+    """Return only active customers matching both a valid city and category."""
+    if type(city_id) is not int or city_id <= 0 or type(category_id) is not int or category_id <= 0:
         return []
-    query = """
-        SELECT DISTINCT u.* FROM users u
-        LEFT JOIN user_categories uc ON uc.user_id = u.id
-        WHERE u.account_type = 'customer' AND u.status = 'active'
-    """
-    args = []
-    idx = 1
-    if city_id:
-        query += f" AND u.city_id = ${idx}"
-        args.append(city_id)
-        idx += 1
-    if category_id:
-        query += f" AND uc.category_id = ${idx}"
-        args.append(category_id)
-        idx += 1
-    return await pool().fetch(query, *args)
+    return await pool().fetch(
+        """SELECT DISTINCT u.* FROM users u
+           JOIN user_categories uc ON uc.user_id=u.id AND uc.category_id=$2
+           JOIN cities ci ON ci.id=u.city_id AND ci.status='active'
+           JOIN categories ca ON ca.id=uc.category_id AND ca.status='active'
+           WHERE u.account_type='customer' AND u.status='active' AND u.city_id=$1""",
+        city_id, category_id,
+    )
 
 
 async def list_active_campaigns_for_user(user_id: int):
     return await pool().fetch(
         """SELECT DISTINCT c.* FROM campaigns c
-           JOIN users u ON u.city_id = c.city_id
+           JOIN businesses b ON b.id=c.business_id AND b.status='approved'
+           JOIN cities ci ON ci.id=c.city_id AND ci.status='active'
+           JOIN categories ca ON ca.id=c.category_id AND ca.status='active'
+           JOIN users u ON u.id=$1 AND u.city_id=c.city_id
+             AND u.account_type='customer' AND u.status='active'
            JOIN user_categories uc ON uc.category_id = c.category_id
-           WHERE c.status='active' AND u.id=$1
+           WHERE c.status='active' AND b.city_id=c.city_id AND uc.user_id=u.id
              AND (c.start_date IS NULL OR c.start_date <= CURRENT_DATE)
              AND (c.end_date IS NULL OR c.end_date >= CURRENT_DATE)
            ORDER BY c.id DESC LIMIT 20""",
@@ -576,7 +632,7 @@ async def all_campaigns_report():
           COUNT(*) FILTER (WHERE e.event_type='CODE_GENERATED') AS codes,
           COUNT(*) FILTER (WHERE e.event_type='REDEEMED') AS redeemed
         FROM campaigns c LEFT JOIN campaign_events e ON e.campaign_id=c.id
-        WHERE c.status IN ('approved','active','expired')
+        WHERE c.status IN ('approved','sending','active','broadcast_failed','expired')
         GROUP BY c.id ORDER BY c.id DESC LIMIT 20
         """
     )

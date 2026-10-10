@@ -238,8 +238,3 @@ def states():
         SELL_CONFIRM: [CallbackQueryHandler(sell_confirm, pattern="^market_(submit|resend|cancel)$")],
         BUY_QUERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, buy_query)],
     }
-
-
-def handlers():
-    from telegram.ext import CallbackQueryHandler
-    return [CallbackQueryHandler(market_menu, pattern="^customer_market$")]
