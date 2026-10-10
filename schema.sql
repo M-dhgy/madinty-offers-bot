@@ -50,8 +50,8 @@ CREATE TABLE IF NOT EXISTS businesses (
     phone          TEXT,
     address        TEXT,
     description    TEXT,
-    is_paid        BOOLEAN NOT NULL DEFAULT FALSE,   -- اشتراك في باقة → يتخطى المراجعة
-    status         TEXT NOT NULL DEFAULT 'pending',  -- pending / approved / rejected
+    is_paid        BOOLEAN NOT NULL DEFAULT FALSE,   -- بيانات اشتراك فقط؛ لا تتجاوز مراجعة الإدارة
+    status         TEXT NOT NULL DEFAULT 'pending',  -- pending / approved / rejected (اعتماد يدوي)
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -74,7 +74,8 @@ CREATE TABLE IF NOT EXISTS campaigns (
     status            TEXT NOT NULL DEFAULT 'draft',
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     approved_at       TIMESTAMPTZ,
-    published_at      TIMESTAMPTZ
+    published_at      TIMESTAMPTZ,
+    broadcast_started_at TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_campaigns_status   ON campaigns(status);
