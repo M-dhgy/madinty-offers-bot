@@ -31,7 +31,6 @@ async def init_pool():
         CREATE INDEX IF NOT EXISTS idx_businesses_city   ON businesses(city_id);
         CREATE INDEX IF NOT EXISTS idx_campaigns_city_cat ON campaigns(city_id, category_id);
         CREATE INDEX IF NOT EXISTS idx_codes_campaign    ON discount_codes(campaign_id, status);
-        CREATE INDEX IF NOT EXISTS idx_listings_user     ON listings(user_id);
 
         CREATE TABLE IF NOT EXISTS listings (
             id SERIAL PRIMARY KEY,
@@ -66,6 +65,8 @@ async def init_pool():
             event_type TEXT NOT NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
+        ALTER TABLE listings ADD COLUMN IF NOT EXISTS city_id INTEGER REFERENCES cities(id);
+        CREATE INDEX IF NOT EXISTS idx_listings_user ON listings(user_id);
         CREATE INDEX IF NOT EXISTS idx_listings_search ON listings(status, city_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_listing_events_listing ON listing_events(listing_id, event_type);
         CREATE INDEX IF NOT EXISTS idx_business_events_business ON business_events(business_id, event_type);
@@ -79,9 +80,16 @@ async def init_pool():
         """)
     except asyncpg.DuplicateObjectError:
         pass
+    except asyncpg.DuplicateTableError:
+        # PostgreSQL reports an existing UNIQUE constraint's backing index as
+        # a duplicate relation when this migration is run more than once.
+        pass
     except asyncpg.UniqueViolationError:
         pass
 
+    # Telegram photo IDs are references, not local files; discard them as soon as
+    # expired listings are observed so they do not accumulate in the database.
+    await expire_listings()
     return _pool
 
 
@@ -277,9 +285,35 @@ async def create_listing(user_id: int, title: str, description: str, price: str 
         """INSERT INTO listings
            (user_id, title, description, price, condition, city_id, category, address,
             contact, delivery, negotiable, image_file_ids)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *""",
+           SELECT $1,$2,$3,$4,$5,ci.id,$7,$8,$9,$10,$11,$12
+           FROM cities ci WHERE ci.id=$6 AND ci.status='active'
+           RETURNING *""",
         user_id, title, description, parsed_price, condition, city_id, category,
         address, contact, delivery, negotiable, image_file_ids[:2],
+    )
+
+
+async def resubmit_listing(listing_id: int, user_id: int, title: str, description: str,
+                           price: str | None, condition: str, city_id: int, category: str,
+                           address: str, contact: str, delivery: str, negotiable: bool,
+                           image_file_ids: list[str]):
+    parsed_price = None
+    if price:
+        try:
+            parsed_price = float(str(price).replace(",", ".").strip())
+        except ValueError:
+            parsed_price = None
+    return await pool().fetchrow(
+        """UPDATE listings AS l SET title=$3, description=$4, price=$5, condition=$6,
+                  city_id=ci.id, category=$8, address=$9, contact=$10, delivery=$11,
+                  negotiable=$12, image_file_ids=$13, status='pending_review',
+                  expires_at=now()+interval '72 hours', updated_at=now()
+           FROM cities ci
+           WHERE l.id=$1 AND l.user_id=$2 AND l.status='rejected'
+             AND ci.id=$7 AND ci.status='active'
+           RETURNING l.*""",
+        listing_id, user_id, title, description, parsed_price, condition, city_id,
+        category, address, contact, delivery, negotiable, image_file_ids[:2],
     )
 
 
@@ -316,8 +350,12 @@ async def get_listing(listing_id: int):
 
 
 async def set_listing_status(listing_id: int, status: str):
+    if status not in {"approved", "rejected"}:
+        raise ValueError("Listing review status must be approved or rejected")
+    expiry_update = ", expires_at=now()+interval '72 hours'" if status == "approved" else ""
     return await pool().fetchrow(
-        "UPDATE listings SET status=$1, updated_at=now() WHERE id=$2 RETURNING *",
+        "UPDATE listings SET status=$1, updated_at=now()" + expiry_update +
+        " WHERE id=$2 AND status='pending_review' RETURNING *",
         status, listing_id,
     )
 
@@ -343,16 +381,20 @@ async def log_listing_event(listing_id: int, user_id: int | None, event_type: st
 
 async def expire_listings():
     await pool().execute(
-        "UPDATE listings SET status='expired', updated_at=now() "
-        "WHERE status IN ('approved','pending_review') AND expires_at <= now()"
+        "UPDATE listings SET status=CASE WHEN status='approved' THEN 'expired' ELSE status END, "
+        "image_file_ids='{}', updated_at=now() "
+        "WHERE (status='approved' AND expires_at <= now()) "
+        "OR (status='expired' AND cardinality(image_file_ids)>0)"
     )
 
 
 async def renew_listing(listing_id: int, user_id: int):
+    await expire_listings()
     return await pool().fetchrow(
         "UPDATE listings SET status='pending_review', "
         "expires_at=now()+interval '72 hours', updated_at=now() "
-        "WHERE id=$1 AND user_id=$2 AND status IN ('expired','approved') RETURNING *",
+        "WHERE id=$1 AND user_id=$2 AND status IN ('expired','approved') "
+        "AND cardinality(image_file_ids)>0 RETURNING *",
         listing_id, user_id,
     )
 

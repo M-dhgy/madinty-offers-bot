@@ -202,7 +202,7 @@ def test_marketplace_uses_the_single_dedicated_conversation(monkeypatch):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         import bot
-        from telegram.ext import CallbackQueryHandler, ConversationHandler
+        from telegram.ext import CallbackQueryHandler, CommandHandler, ConversationHandler
 
         application = bot.build_application()
 
@@ -218,6 +218,13 @@ def test_marketplace_uses_the_single_dedicated_conversation(monkeypatch):
         and handler.pattern.match("customer_market")
         for handler in conversation.entry_points
     )
+    assert any(
+        isinstance(handler, CommandHandler) and handler.commands == {"editlisting"}
+        for handler in conversation.entry_points
+    )
+    assert bot.marketplace.EDIT_LISTING_CITY in conversation.states
+    assert bot.marketplace.EDIT_LISTING_MESSAGE in conversation.states
+    assert bot.marketplace.EDIT_LISTING_CONFIRM in conversation.states
     assert not any(11 <= state <= 23 for state in conversation.states if isinstance(state, int))
     assert not hasattr(bot, "listing_start")
 
@@ -230,3 +237,47 @@ def test_merchant_launch_notice_makes_free_period_and_future_fees_clear(monkeypa
     assert "مجاني" in notice
     assert "محدودة" in notice
     assert "مسبقًا" in notice
+
+
+def test_campaign_approval_callback_notifies_campaign_owner(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:TEST_TOKEN")
+    import bot
+
+    campaign = {"id": 17, "business_id": 4, "title": "عرض تجريبي"}
+    query = SimpleNamespace(
+        data="admin_approve_17",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+    update = SimpleNamespace(callback_query=query)
+    context = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+
+    with (
+        patch.object(bot, "is_admin", return_value=True),
+        patch.object(bot.db, "review_campaign", new=AsyncMock(return_value=campaign)),
+        patch.object(bot.db, "get_business", new=AsyncMock(return_value={"owner_telegram_id": 765})),
+    ):
+        asyncio.run(bot.admin_campaign_action(update, context))
+
+    assert context.bot.send_message.await_args.args[0] == 765
+    assert "تمت الموافقة" in context.bot.send_message.await_args.args[1]
+    assert "#17" in context.bot.send_message.await_args.args[1]
+
+
+def test_campaign_rejection_command_notifies_merchant_of_decision(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:TEST_TOKEN")
+    import bot
+
+    campaign = {"id": 17, "business_id": 4, "title": "عرض تجريبي"}
+    update = SimpleNamespace(
+        message=SimpleNamespace(text="/reject_17", reply_text=AsyncMock())
+    )
+    context = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+    with (
+        patch.object(bot, "is_admin", return_value=True),
+        patch.object(bot.db, "review_campaign", new=AsyncMock(return_value=campaign)),
+        patch.object(bot, "notify_merchant_campaign_decision", new=AsyncMock()) as notify,
+    ):
+        asyncio.run(bot.cmd_approve_reject(update, context))
+
+    notify.assert_awaited_once_with(context, campaign, "rejected")

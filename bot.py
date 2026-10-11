@@ -17,6 +17,7 @@ bot.py — بوت عروض مدينتي (Madinty Offers) — MVP قابل للت
 import logging
 import math
 import os
+from uuid import uuid4
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
@@ -39,6 +40,39 @@ import marketplace
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("madinty-bot")
+
+
+def _callback_message_reference(message, chat_id=None):
+    message_id = getattr(message, "message_id", None)
+    if chat_id is None:
+        chat = getattr(message, "chat", None)
+        chat_id = getattr(chat, "id", None) or getattr(message, "chat_id", None)
+    if type(chat_id) is int and type(message_id) is int:
+        return {"chat_id": chat_id, "message_id": message_id}
+    return None
+
+
+async def _invalidate_user_keyboard(context, key: str):
+    reference = context.user_data.pop(key, None)
+    if not reference or not getattr(context, "bot", None):
+        return
+    try:
+        await context.bot.edit_message_reply_markup(**reference, reply_markup=None)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("تعذر حذف أزرار المعاينة القديمة: %s", exc)
+
+
+async def _clear_campaign_preview(context):
+    await _invalidate_user_keyboard(context, "campaign_preview_message")
+    context.user_data.pop("campaign_preview_id", None)
+
+
+async def _reject_stale_campaign_callback(query):
+    await query.answer("انتهت صلاحية هذا الزر؛ استخدم أزرار أحدث معاينة.", show_alert=True)
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("تعذر إزالة أزرار الحملة القديمة: %s", exc)
 
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_TELEGRAM_IDS", "").split(",") if x.strip()}
 
@@ -351,10 +385,14 @@ async def admin_listings_callback(update: Update, context: ContextTypes.DEFAULT_
     for row in rows:
         price = str(row["price"]) if row["price"] is not None else "عند التواصل"
         for photo_id in (row["image_file_ids"] or [])[:2]:
-            await context.bot.send_photo(update.effective_user.id, photo_id)
+            try:
+                await context.bot.send_photo(update.effective_user.id, photo_id)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("تعذر إرسال صورة الإعلان %s للمراجعة: %s", row["id"], exc)
         await query.message.reply_text(
             f"📦 الإعلان #{row['id']}\n{row['title']}\n"
             f"السعر: {price}\nالتفاوض: {'مسموح' if row['negotiable'] else 'غير مسموح'}\n"
+            f"المدينة: {row['city_name'] or 'غير محددة'}\n"
             f"العنوان: {row['address'] or 'غير محدد'}\n"
             f"التواصل: {row['contact'] or 'غير محدد'}\nالتوصيل: {row['delivery'] or 'غير محدد'}\n\n"
             f"{row['description'] or ''}",
@@ -382,7 +420,10 @@ async def admin_listing_action(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("هذا الإعلان لم يعد بانتظار المراجعة.")
         return
     status = "approved" if action == "approve" else "rejected"
-    await db.set_listing_status(listing_id, status)
+    listing = await db.set_listing_status(listing_id, status)
+    if not listing:
+        await query.edit_message_text("هذا الإعلان لم يعد بانتظار المراجعة.")
+        return
     try:
         owner = await db.get_user_by_id(listing["user_id"])
         if owner:
@@ -398,7 +439,7 @@ async def admin_listing_action(update: Update, context: ContextTypes.DEFAULT_TYP
             else:
                 notice = (
                     f"❌ لم تتم الموافقة على إعلانك رقم #{listing_id}.\n"
-                    "يمكنك تعديل البيانات وإرساله للمراجعة مرة أخرى."
+                    f"يمكنك تعديل بياناته وصورته ثم إعادة إرساله عبر الأمر /editlisting {listing_id}."
                 )
             await context.bot.send_message(
                 owner["telegram_id"],
@@ -409,6 +450,28 @@ async def admin_listing_action(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.edit_message_text(
         f"{'✅ تم اعتماد' if status == 'approved' else '❌ تم رفض'} الإعلان #{listing_id}."
     )
+
+
+async def notify_merchant_campaign_decision(context, campaign, status: str):
+    """Notify the campaign owner after a review transition, without blocking admin feedback."""
+    campaign_id = campaign["id"]
+    try:
+        business = await db.get_business(campaign["business_id"])
+        if not business:
+            return
+        if status == "approved":
+            notice = (
+                f"✅ تمت الموافقة على حملتك #{campaign_id}: {campaign['title']}\n"
+                "أصبحت جاهزة للنشر من الإدارة؛ لم يبدأ بثها للمستخدمين بعد."
+            )
+        else:
+            notice = (
+                f"❌ لم تتم الموافقة على حملتك #{campaign_id}: {campaign['title']}.\n"
+                "للاستفسار أو مراجعة المحتوى، تواصل مع الدعم @madinty_support."
+            )
+        await context.bot.send_message(business["owner_telegram_id"], notice)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("تعذر إشعار صاحب الحملة %s: %s", campaign_id, exc)
 
 
 async def admin_campaign_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -427,6 +490,9 @@ async def admin_campaign_action(update: Update, context: ContextTypes.DEFAULT_TY
     if not campaign:
         await query.edit_message_text("هذه الحملة لم تعد بانتظار المراجعة.")
         return
+    await notify_merchant_campaign_decision(
+        context, campaign, "approved" if action == "approve" else "rejected"
+    )
     if action == "approve":
         await query.edit_message_text(
             f"✅ تم اعتماد الحملة #{campaign_id}.",
@@ -638,6 +704,8 @@ async def merchant_menu_router(update: Update, context: ContextTypes.DEFAULT_TYP
         if not business or business["status"] != "approved":
             await query.edit_message_text(_business_status_text(business))
             return MER_MENU
+        await _clear_campaign_preview(context)
+        context.user_data.pop("pending_campaign", None)
         await query.edit_message_text(
             f"{MERCHANT_LAUNCH_PRICING_NOTICE}\n\n"
             "✍️ اكتب وصفاً حراً للعرض (مثال: عندنا خصم 30% على الوجبات البحرية "
@@ -685,6 +753,8 @@ async def merchant_text_menu_router(update: Update, context: ContextTypes.DEFAUL
         if not business or business["status"] != "approved":
             await update.message.reply_text(_business_status_text(business))
             return MER_MENU
+        await _clear_campaign_preview(context)
+        context.user_data.pop("pending_campaign", None)
         await update.message.reply_text(
             f"{MERCHANT_LAUNCH_PRICING_NOTICE}\n\n"
             "✍️ اكتب وصفاً حراً للعرض (مثال: خصم 30% على الوجبات البحرية من الخميس للسبت)."
@@ -820,39 +890,60 @@ async def campaign_description_received(update: Update, context: ContextTypes.DE
         return CAMPAIGN_DESC
 
     ad_text = await ai.generate_ad_copy(data)
-    context.user_data["pending_campaign"] = {"raw": raw_text, "ai_data": data, "ad_text": ad_text}
+    await _clear_campaign_preview(context)
+    preview_id = uuid4().hex[:12]
+    context.user_data["pending_campaign"] = {
+        "raw": raw_text, "ai_data": data, "ad_text": ad_text, "preview_id": preview_id
+    }
 
-    await update.message.reply_text(
+    preview_message = await update.message.reply_text(
         f"📢 معاينة الإعلان:\n\n{ad_text}\n\n"
         f"الفئة: {data.get('category_code')} | المدينة: {data.get('city_code')} | "
         f"الخصم: {data.get('discount')}%",
         reply_markup=InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("✅ إرسال للمراجعة", callback_data="submit_campaign")],
-                [InlineKeyboardButton("✏️ إعادة الكتابة", callback_data="rewrite_campaign")],
+                [InlineKeyboardButton("✅ إرسال للمراجعة", callback_data=f"campaign_{preview_id}_submit")],
+                [InlineKeyboardButton("✏️ إعادة الكتابة", callback_data=f"campaign_{preview_id}_rewrite")],
             ]
         ),
     )
+    context.user_data["campaign_preview_id"] = preview_id
+    reference = _callback_message_reference(preview_message, update.effective_chat.id)
+    if reference:
+        context.user_data["campaign_preview_message"] = reference
     return CAMPAIGN_CONFIRM
 
 
 async def campaign_confirm_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    parts = query.data.split("_")
+    pending = context.user_data.get("pending_campaign")
+    preview_id = parts[1] if len(parts) == 3 and parts[0] == "campaign" else None
+    action = parts[-1]
+    if (
+        not preview_id
+        or not pending
+        or preview_id != pending.get("preview_id")
+        or preview_id != context.user_data.get("campaign_preview_id")
+        or action not in {"submit", "rewrite"}
+    ):
+        await _reject_stale_campaign_callback(query)
+        return CAMPAIGN_CONFIRM if pending else MER_MENU
     await query.answer()
 
-    if query.data == "rewrite_campaign":
+    if action == "rewrite":
+        context.user_data.pop("pending_campaign", None)
+        context.user_data.pop("campaign_preview_id", None)
+        context.user_data.pop("campaign_preview_message", None)
         await query.edit_message_text("✍️ اكتب الوصف مرة أخرى:")
         return CAMPAIGN_DESC
-
-    pending = context.user_data.get("pending_campaign")
-    if not pending:
-        await query.edit_message_text("انتهت صلاحية المعاينة، ابدأ حملة جديدة من القائمة.")
-        return await show_merchant_menu(query, context)
 
     data = pending["ai_data"]
     business = await db.get_business_by_user(context.user_data["db_user_id"])
     if not business or business["status"] != "approved":
         context.user_data.pop("pending_campaign", None)
+        context.user_data.pop("campaign_preview_id", None)
+        context.user_data.pop("campaign_preview_message", None)
         await query.edit_message_text(_business_status_text(business))
         return await show_merchant_menu(query, context)
     business_id = business["id"]
@@ -872,6 +963,8 @@ async def campaign_confirm_router(update: Update, context: ContextTypes.DEFAULT_
             "⚠️ لا يمكن إرسال الحملة: يجب أن تكون المدينة النشطة مطابقة لموقع النشاط وأن تكون الفئة نشطة."
         )
         context.user_data.pop("pending_campaign", None)
+        context.user_data.pop("campaign_preview_id", None)
+        context.user_data.pop("campaign_preview_message", None)
         return await show_merchant_menu(query, context)
 
     campaign = await db.create_campaign(
@@ -883,6 +976,8 @@ async def campaign_confirm_router(update: Update, context: ContextTypes.DEFAULT_
         city_id=city_row["id"] if city_row else None,
     )
     context.user_data.pop("pending_campaign", None)
+    context.user_data.pop("campaign_preview_id", None)
+    context.user_data.pop("campaign_preview_message", None)
     if not campaign:
         await query.edit_message_text(
             "⚠️ لم تُحفظ الحملة لأن النشاط غير معتمد أو أن هدفها لم يعد صالحًا."
@@ -957,6 +1052,7 @@ async def cmd_approve_reject(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     status = "approved" if action == "approve" else "rejected"
     await update.message.reply_text(f"تم تحديث الحملة #{campaign_id} إلى: {status}")
+    await notify_merchant_campaign_decision(context, campaign, status)
 
     if status == "approved":
         await update.message.reply_text(f"لنشر الحملة الآن استخدم: /send_{campaign_id}")
@@ -1083,7 +1179,8 @@ async def listing_contact_callback(update: Update, context: ContextTypes.DEFAULT
             "يمكنك التواصل معه عبر Telegram.",
         )
     await query.message.reply_text(
-        f"للتواصل مع المعلن: {('@' + owner['username']) if owner and owner['username'] else 'سيصلك إشعار من المعلن قريبًا.'}"
+        f"رقم التواصل مع المعلن: {listing['contact'] or 'غير مسجل'}\n"
+        f"حساب Telegram: {('@' + owner['username']) if owner and owner['username'] else 'غير متاح'}"
     )
 
 
@@ -1174,13 +1271,25 @@ async def cmd_renew_listing(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("الاستخدام: /renew رقم_الإعلان")
         return
     user = await db.get_user_by_telegram_id(update.effective_user.id)
-    listing = await db.renew_listing(int(context.args[0]), user["id"]) if user else None
+    listing_id = int(context.args[0])
+    listing = await db.renew_listing(listing_id, user["id"]) if user else None
     if listing:
         await update.message.reply_text(
             f"✅ تم تجديد الإعلان #{listing['id']} لمدة 72 ساعة وأصبح قيد مراجعة الإدارة مجددًا."
         )
     else:
-        await update.message.reply_text("لا يمكن تجديد هذا الإعلان أو أنه لا يخص حسابك.")
+        previous = await db.get_listing(listing_id) if user else None
+        if (
+            previous
+            and previous["user_id"] == user["id"]
+            and previous["status"] == "expired"
+            and not (previous["image_file_ids"] or [])
+        ):
+            await update.message.reply_text(
+                "انتهت صلاحية الإعلان وحُذف مرجع صورته. أنشئ إعلانًا جديدًا من سوق الأفراد وارفع صورة حديثة."
+            )
+        else:
+            await update.message.reply_text("لا يمكن تجديد هذا الإعلان أو أنه لا يخص حسابك.")
 
 
 async def cmd_sold_listing(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1238,6 +1347,7 @@ def build_application() -> Application:
     conv = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
+            CommandHandler("editlisting", marketplace.edit_listing_start),
             CallbackQueryHandler(marketplace.market_menu, pattern="^customer_market$"),
         ],
         states={
@@ -1266,7 +1376,10 @@ def build_application() -> Application:
             ],
             REDEEM_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, merchant_redeem_code_received)],
             CAMPAIGN_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, campaign_description_received)],
-            CAMPAIGN_CONFIRM: [CallbackQueryHandler(campaign_confirm_router, pattern=r"^(submit_campaign|rewrite_campaign)$")],
+            CAMPAIGN_CONFIRM: [CallbackQueryHandler(
+                campaign_confirm_router,
+                pattern=r"^(?:submit_campaign|rewrite_campaign|campaign_[0-9a-f]{12}_(?:submit|rewrite))$",
+            )],
             **marketplace.states(),
         },
         fallbacks=[CommandHandler("cancel", cancel)],
