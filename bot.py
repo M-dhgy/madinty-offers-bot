@@ -17,9 +17,13 @@ bot.py — بوت عروض مدينتي (Madinty Offers) — MVP قابل للت
 import logging
 import math
 import os
+from pathlib import Path
 from uuid import uuid4
 
 from dotenv import load_dotenv
+
+load_dotenv(dotenv_path=Path(__file__).resolve().with_name(".env"), override=False)
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -36,8 +40,6 @@ import ai
 import campaign_broadcast
 import db
 import marketplace
-
-load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("madinty-bot")
 
