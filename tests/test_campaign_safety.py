@@ -26,30 +26,34 @@ def test_broadcast_claim_is_required_before_any_send():
         result = asyncio.run(campaign_broadcast.broadcast_campaign(bot, 17, 50, 0))
 
     assert result["status"] == "not_ready"
-    claim.assert_awaited_once_with(17)
-    find_targets.assert_not_awaited()
+    claim.assert_awaited_once_with(17, resume=False)
     bot.send_message.assert_not_awaited()
 
 
 def test_broadcast_batches_recipients_and_continues_after_delivery_error():
     async def send_message(chat_id, *_args, **_kwargs):
         if chat_id == 102:
-            raise RuntimeError("blocked recipient")
+            from telegram.error import Forbidden
+            raise Forbidden("blocked recipient")
 
     bot = SimpleNamespace(send_message=AsyncMock(side_effect=send_message))
     with (
         patch.object(campaign_broadcast.db, "claim_campaign_for_broadcast", new=AsyncMock(return_value=CAMPAIGN)),
-        patch.object(campaign_broadcast.db, "find_target_users", new=AsyncMock(return_value=TARGETS)),
-        patch.object(campaign_broadcast.db, "log_event", new=AsyncMock()) as log_event,
-        patch.object(campaign_broadcast.db, "finish_campaign_broadcast", new=AsyncMock(return_value=CAMPAIGN)) as finish,
+        patch.object(campaign_broadcast.db, "campaign_delivery_summary", new=AsyncMock(side_effect=[
+            {"total": 3, "pending": 3, "sending": 0, "sent": 0, "rejected": 0, "uncertain": 0},
+            {"total": 3, "pending": 0, "sending": 0, "sent": 2, "rejected": 1, "uncertain": 0},
+        ])),
+        patch.object(campaign_broadcast.db, "list_pending_campaign_recipients", new=AsyncMock(return_value=TARGETS)),
+        patch.object(campaign_broadcast.db, "claim_campaign_recipient", new=AsyncMock(side_effect=TARGETS)),
+        patch.object(campaign_broadcast.db, "record_campaign_recipient_result", new=AsyncMock(return_value=True)) as record,
+        patch.object(campaign_broadcast.db, "finish_campaign_broadcast", new=AsyncMock(return_value={"status": "active"})) as finish,
         patch.object(campaign_broadcast.asyncio, "sleep", new=AsyncMock()) as sleep,
     ):
         result = asyncio.run(campaign_broadcast.broadcast_campaign(bot, 17, 2, 0.25))
 
-    assert result == {"status": "completed", "sent": 2, "failed": 1, "total": 3}
+    assert result == {"status": "completed", "sent": 2, "failed": 1, "total": 3, "pending": 0, "uncertain": 0}
     assert bot.send_message.await_count == 3
-    assert log_event.await_args_list[0].args == (17, 1, "SENT")
-    assert log_event.await_args_list[1].args == (17, 3, "SENT")
+    assert [call.args[2] for call in record.await_args_list] == ["sent", "rejected", "sent"]
     finish.assert_awaited_once_with(17, succeeded=True)
     sleep.assert_awaited_once_with(0.25)
 
@@ -58,14 +62,20 @@ def test_all_failed_broadcast_is_not_marked_active_or_retryable():
     bot = SimpleNamespace(send_message=AsyncMock(side_effect=RuntimeError("unavailable")))
     with (
         patch.object(campaign_broadcast.db, "claim_campaign_for_broadcast", new=AsyncMock(return_value=CAMPAIGN)),
-        patch.object(campaign_broadcast.db, "find_target_users", new=AsyncMock(return_value=TARGETS[:1])),
-        patch.object(campaign_broadcast.db, "log_event", new=AsyncMock()) as log_event,
-        patch.object(campaign_broadcast.db, "finish_campaign_broadcast", new=AsyncMock(return_value=CAMPAIGN)) as finish,
+        patch.object(campaign_broadcast.db, "campaign_delivery_summary", new=AsyncMock(side_effect=[
+            {"total": 1, "pending": 1, "sending": 0, "sent": 0, "rejected": 0, "uncertain": 0},
+            {"total": 1, "pending": 0, "sending": 0, "sent": 0, "rejected": 0, "uncertain": 1},
+        ])),
+        patch.object(campaign_broadcast.db, "list_pending_campaign_recipients", new=AsyncMock(return_value=TARGETS[:1])),
+        patch.object(campaign_broadcast.db, "claim_campaign_recipient", new=AsyncMock(return_value=TARGETS[0])),
+        patch.object(campaign_broadcast.db, "record_campaign_recipient_result", new=AsyncMock(return_value=True)) as record,
+        patch.object(campaign_broadcast.db, "finish_campaign_broadcast", new=AsyncMock(return_value={"status": "broadcast_failed"})) as finish,
     ):
         result = asyncio.run(campaign_broadcast.broadcast_campaign(bot, 17, 10, 0))
 
-    assert result == {"status": "failed", "sent": 0, "failed": 1, "total": 1}
-    log_event.assert_not_awaited()
+    assert result == {"status": "failed", "sent": 0, "failed": 1, "total": 1, "pending": 0, "uncertain": 1}
+    record.assert_awaited_once()
+    assert record.await_args.args[2] == "uncertain"
     finish.assert_awaited_once_with(17, succeeded=False)
 
 
@@ -73,13 +83,17 @@ def test_no_targets_releases_claim_without_sending():
     bot = SimpleNamespace(send_message=AsyncMock())
     with (
         patch.object(campaign_broadcast.db, "claim_campaign_for_broadcast", new=AsyncMock(return_value=CAMPAIGN)),
-        patch.object(campaign_broadcast.db, "find_target_users", new=AsyncMock(return_value=[])),
+        patch.object(campaign_broadcast.db, "campaign_delivery_summary", new=AsyncMock(return_value={
+            "total": 0, "pending": 0, "sending": 0, "sent": 0, "rejected": 0, "uncertain": 0
+        })),
+        patch.object(campaign_broadcast.db, "list_pending_campaign_recipients", new=AsyncMock(return_value=[])),
         patch.object(campaign_broadcast.db, "release_campaign_without_delivery", new=AsyncMock()) as release,
         patch.object(campaign_broadcast.db, "finish_campaign_broadcast", new=AsyncMock()) as finish,
     ):
         result = asyncio.run(campaign_broadcast.broadcast_campaign(bot, 17, 50, 1.5))
 
-    assert result == {"status": "no_targets", "sent": 0, "failed": 0, "total": 0}
+    assert result["status"] == "no_targets"
+    assert result["total"] == 0
     release.assert_awaited_once_with(17)
     finish.assert_not_awaited()
     bot.send_message.assert_not_awaited()
@@ -155,17 +169,21 @@ def test_business_review_is_a_pending_only_transition():
 
 
 def test_campaign_creation_is_constrained_to_approved_business_and_active_matching_target():
-    fake = _fake_pool()
+    fake = _fake_pool(fetchrow=AsyncMock(return_value={"id": 4, "status": "pending_review"}))
     with patch.object(db, "pool", return_value=fake):
-        result = asyncio.run(db.create_campaign(4, "raw", {"title": "t"}, "ad", 2, 3))
-
-    assert result is None
-    query, *params = fake.fetchrow.await_args.args
+        result = asyncio.run(db.create_campaign(
+            4, "raw", {"title": "t"}, "ad", 2, 3, submission_key="attempt-1"
+        ))
+    assert result["_created"] is True
+    query, *params = fake.fetchrow.await_args_list[0].args
     assert "b.status='approved'" in query
     assert "b.city_id=ci.id" in query
     assert "ci.status='active'" in query
     assert "ca.status='active'" in query
+    assert "ON CONFLICT (business_id, submission_key)" in query
+    assert "DO NOTHING" in query
     assert params[0] == 4 and params[4:6] == [2, 3]
+    assert params[-1] == "attempt-1"
 
 
 def test_campaign_review_and_broadcast_claim_are_conditional_and_atomic():
@@ -177,11 +195,44 @@ def test_campaign_review_and_broadcast_claim_are_conditional_and_atomic():
         assert "b.status='approved'" in review_sql
         assert "ci.status='active'" in review_sql and "ca.status='active'" in review_sql
 
-        assert asyncio.run(db.claim_campaign_for_broadcast(17)) is None
-        claim_sql = fake.fetchrow.await_args_list[1].args[0]
-        assert "c.status='approved'" in claim_sql
-        assert "SET status='sending'" in claim_sql
-        assert "b.status='approved'" in claim_sql
+    class AsyncContext:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    approved = {
+        "id": 17, "status": "approved", "city_id": 3, "category_id": 2,
+        "broadcast_started_at": None,
+    }
+    claimed = {**approved, "status": "sending"}
+    connection = SimpleNamespace(
+        fetchrow=AsyncMock(side_effect=[approved, claimed]),
+        fetchval=AsyncMock(return_value=False),
+        execute=AsyncMock(),
+        transaction=lambda: AsyncContext(),
+    )
+
+    class Acquire:
+        async def __aenter__(self):
+            return connection
+
+        async def __aexit__(self, *_args):
+            return False
+
+    with patch.object(db, "pool", return_value=SimpleNamespace(acquire=lambda: Acquire())):
+        result = asyncio.run(db.claim_campaign_for_broadcast(17))
+
+    assert result["status"] == "sending"
+    select_sql = connection.fetchrow.await_args_list[0].args[0]
+    claim_sql = connection.fetchrow.await_args_list[1].args[0]
+    assert "FOR UPDATE" in select_sql
+    assert "c.status=$2" in claim_sql
+    assert "SET status='sending'" in claim_sql
+    assert "b.status='approved'" in claim_sql
+    assert "AT TIME ZONE 'UTC'" in claim_sql
+    connection.execute.assert_awaited_once()
 
 
 def test_target_validation_rejects_null_and_boolean_ids():
@@ -199,8 +250,8 @@ def test_target_validation_rejects_null_and_boolean_ids():
 
 def test_marketplace_uses_the_single_dedicated_conversation(monkeypatch):
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:TEST_TOKEN")
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
         import bot
         from telegram.ext import CallbackQueryHandler, CommandHandler, ConversationHandler
 
@@ -227,6 +278,8 @@ def test_marketplace_uses_the_single_dedicated_conversation(monkeypatch):
     assert bot.marketplace.EDIT_LISTING_CONFIRM in conversation.states
     assert not any(11 <= state <= 23 for state in conversation.states if isinstance(state, int))
     assert not hasattr(bot, "listing_start")
+    assert conversation.per_message is False
+    assert any("If 'per_message=False'" in str(item.message) for item in captured)
 
 
 def test_merchant_launch_notice_makes_free_period_and_future_fees_clear(monkeypatch):

@@ -7,6 +7,8 @@ v0.2:
 
 import json
 import os
+import re
+import unicodedata
 from openai import AsyncOpenAI
 
 _client: AsyncOpenAI | None = None
@@ -27,8 +29,8 @@ def client() -> AsyncOpenAI:
         _client = AsyncOpenAI(
             api_key=os.environ["GROQ_API_KEY"],
             base_url=_base_url(),
-            timeout=float(os.environ.get("AI_TIMEOUT_SECONDS") or "45"),
-            max_retries=2,
+            timeout=float(os.environ.get("AI_TIMEOUT_SECONDS") or "20"),
+            max_retries=0,
         )
     return _client
 
@@ -99,6 +101,8 @@ EXTRACTION_SYSTEM_PROMPT = """
   "end": "YYYY-MM-DD أو null",
   "issues": ["أي معلومة ناقصة أو غير منطقية أو مخالفة"]
 }
+تاريخا البداية والنهاية اختياريان؛ أعد null عند عدم ذكرهما ولا تعتبر غيابهما مشكلة.
+أضف مشكلة فقط إذا كان التاريخ بصيغة غير صالحة أو كانت النهاية قبل البداية.
 لا تكتب أي نص خارج كائن الـ JSON.
 """
 
@@ -207,12 +211,16 @@ async def extract_listing_data(raw_text: str) -> dict:
 async def rank_listing_ids(query: str, listings: list[dict]) -> list[int]:
     if not listings:
         return []
+    local_ids = rank_listing_ids_locally(query, listings)
+    if not local_ids:
+        return []
+    local_id_set = set(local_ids)
     try:
         compact = [
             {"id": x["id"], "title": x["title"],
              "description": x.get("description", ""),
              "category": x.get("category", "")}
-            for x in listings
+            for x in listings if x["id"] in local_id_set
         ]
         resp = await client().chat.completions.create(
             model=_model(),
@@ -236,13 +244,69 @@ async def rank_listing_ids(query: str, listings: list[dict]) -> list[int]:
             response_format={"type": "json_object"},
         )
         ids = json.loads(resp.choices[0].message.content or "{}").get("ids", [])
-        valid = {x["id"] for x in listings}
-        return [int(x) for x in ids if str(x).isdigit() and int(x) in valid]
+        if not isinstance(ids, list):
+            ids = []
+        ranked = []
+        seen = set()
+        for value in ids:
+            if not str(value).isdigit():
+                continue
+            listing_id = int(value)
+            if listing_id in local_id_set and listing_id not in seen:
+                ranked.append(listing_id)
+                seen.add(listing_id)
+        return ranked + [listing_id for listing_id in local_ids if listing_id not in seen]
     except Exception:
-        words = set(query.lower().split())
-        scored = sorted(
-            listings,
-            key=lambda x: len(words & set((x["title"] + " " + (x["description"] or "")).lower().split())),
-            reverse=True,
+        return local_ids
+
+
+_ARABIC_DIACRITICS = re.compile(r"[\u064b-\u065f\u0670\u06d6-\u06ed]")
+_SEARCH_PUNCTUATION = re.compile(r"[^\w]+", re.UNICODE)
+_SEARCH_TRANSLATION = str.maketrans({
+    "أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا", "ى": "ي", "ة": "ه", "ـ": "",
+})
+_SEARCH_STOP_WORDS = {
+    "في", "من", "على", "عن", "الى", "إلى", "مع", "او", "أو", "و", "يا",
+    "اريد", "عايز", "عاوزه", "ابحث", "بحث", "مطلوب", "لدي", "عندي",
+}
+_FOOD_SEARCH_TERMS = {
+    "ماكولات", "اكل", "طعام", "اطعمه", "وجبات", "وجبه", "مطاعم", "مطعم",
+    "كافيه", "مقهي", "مشروبات", "مشروب", "بقاله", "طبخ", "دجاج", "لحوم",
+    "خضار", "فواكه", "حلويات", "مخبوزات", "عصائر", "عصير",
+}
+_FOOD_SEARCH_SYNONYMS = {
+    term: _FOOD_SEARCH_TERMS for term in _FOOD_SEARCH_TERMS
+}
+
+
+def _listing_search_tokens(value) -> set[str]:
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    text = _ARABIC_DIACRITICS.sub("", text).translate(_SEARCH_TRANSLATION)
+    return {
+        token for token in _SEARCH_PUNCTUATION.split(text)
+        if token and token not in _SEARCH_STOP_WORDS
+    }
+
+
+def rank_listing_ids_locally(query: str, listings: list[dict]) -> list[int]:
+    """Rank only lexically relevant listings; never treat a failed match as all results."""
+    query_tokens = _listing_search_tokens(query)
+    for token in tuple(query_tokens):
+        query_tokens.update(_FOOD_SEARCH_SYNONYMS.get(token, ()))
+    if not query_tokens:
+        return []
+
+    scored = []
+    for index, listing in enumerate(listings):
+        title_tokens = _listing_search_tokens(listing.get("title"))
+        category_tokens = _listing_search_tokens(listing.get("category"))
+        description_tokens = _listing_search_tokens(listing.get("description"))
+        score = (
+            3 * len(query_tokens & title_tokens)
+            + 4 * len(query_tokens & category_tokens)
+            + len(query_tokens & description_tokens)
         )
-        return [x["id"] for x in scored]
+        if score:
+            scored.append((score, index, listing["id"]))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [listing_id for _score, _index, listing_id in scored]

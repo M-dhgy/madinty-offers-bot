@@ -75,11 +75,15 @@ CREATE TABLE IF NOT EXISTS campaigns (
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     approved_at       TIMESTAMPTZ,
     published_at      TIMESTAMPTZ,
-    broadcast_started_at TIMESTAMPTZ
+    broadcast_started_at TIMESTAMPTZ,
+    submission_key    TEXT
 );
 
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS submission_key TEXT;
 CREATE INDEX IF NOT EXISTS idx_campaigns_status   ON campaigns(status);
 CREATE INDEX IF NOT EXISTS idx_campaigns_city_cat ON campaigns(city_id, category_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_campaigns_submission_key
+    ON campaigns(business_id, submission_key) WHERE submission_key IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS discount_codes (
     id            SERIAL PRIMARY KEY,
@@ -123,12 +127,17 @@ CREATE TABLE IF NOT EXISTS listings (
     image_file_ids TEXT[] NOT NULL DEFAULT '{}',
     expires_at     TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '72 hours'),
     status         TEXT NOT NULL DEFAULT 'pending_review',
+    submission_key TEXT,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS submission_key TEXT;
 CREATE INDEX IF NOT EXISTS idx_listings_search ON listings(status, city_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_listings_user   ON listings(user_id);
+CREATE INDEX IF NOT EXISTS idx_listings_expiry ON listings(status, expires_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_listings_submission_key
+    ON listings(user_id, submission_key) WHERE submission_key IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS listing_events (
     id         SERIAL PRIMARY KEY,

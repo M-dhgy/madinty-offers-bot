@@ -143,10 +143,12 @@ def test_campaign_preview_ids_are_unique_and_old_keyboard_is_invalidated(monkeyp
     assert first_state == second_state == bot.CAMPAIGN_CONFIRM
     assert first_id != second_id
     assert _callbacks(first_markup) == {
-        f"campaign_{first_id}_submit", f"campaign_{first_id}_rewrite"
+        f"campaign_{first_id}_submit", f"campaign_{first_id}_rewrite",
+        "merchant_menu", "main_menu",
     }
     assert _callbacks(second_markup) == {
-        f"campaign_{second_id}_submit", f"campaign_{second_id}_rewrite"
+        f"campaign_{second_id}_submit", f"campaign_{second_id}_rewrite",
+        "merchant_menu", "main_menu",
     }
     context.bot.edit_message_reply_markup.assert_awaited_once_with(
         chat_id=900, message_id=71, reply_markup=None
@@ -208,3 +210,40 @@ def test_admin_listing_review_continues_when_telegram_rejects_photo(monkeypatch)
     assert "0912345678" in args.args[0]
     callbacks = _callbacks(args.kwargs["reply_markup"])
     assert callbacks == {"listing_approve_45", "listing_reject_45"}
+
+
+def test_campaign_submission_passes_stable_idempotency_key(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:TEST_TOKEN")
+    import bot
+
+    preview_id = "fedcba654321"
+    query = SimpleNamespace(
+        data=f"campaign_{preview_id}_submit",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+    pending = {
+        "preview_id": preview_id,
+        "submission_key": "stable-campaign-key",
+        "raw": "وصف العرض",
+        "ai_data": {"category_code": "FOOD", "city_code": "KHARTOUM", "discount": 10},
+        "ad_text": "نص الإعلان",
+    }
+    context = SimpleNamespace(
+        user_data={"db_user_id": 17, "pending_campaign": pending, "campaign_preview_id": preview_id}
+    )
+    pool = SimpleNamespace(
+        fetchrow=AsyncMock(side_effect=[{"id": 2}, {"id": 3}])
+    )
+    with (
+        patch.object(bot.db, "get_business_by_user", new=AsyncMock(return_value={"id": 9, "status": "approved"})),
+        patch.object(bot.db, "pool", return_value=pool),
+        patch.object(bot.db, "validate_campaign_target", new=AsyncMock(return_value=True)),
+        patch.object(bot.db, "create_campaign", new=AsyncMock(return_value={"id": 55})) as create,
+        patch.object(bot, "notify_admins_new_campaign", new=AsyncMock()),
+        patch.object(bot, "show_merchant_menu", new=AsyncMock(return_value=bot.MER_MENU)),
+    ):
+        state = asyncio.run(bot.campaign_confirm_router(SimpleNamespace(callback_query=query), context))
+
+    assert state == bot.MER_MENU
+    assert create.await_args.kwargs["submission_key"] == "stable-campaign-key"

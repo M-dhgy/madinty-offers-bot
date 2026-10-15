@@ -17,6 +17,7 @@ bot.py — بوت عروض مدينتي (Madinty Offers) — MVP قابل للت
 import logging
 import math
 import os
+import re
 from pathlib import Path
 from uuid import uuid4
 
@@ -26,6 +27,7 @@ load_dotenv(dotenv_path=Path(__file__).resolve().with_name(".env"), override=Fal
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -54,6 +56,79 @@ def _callback_message_reference(message, chat_id=None):
     return None
 
 
+async def _safe_answer(query, message=None, show_alert=False):
+    """A Telegram callback acknowledgement timeout must not cancel its action."""
+    try:
+        if message is None and not show_alert:
+            await query.answer()
+        else:
+            await query.answer(message, show_alert=show_alert)
+    except TimedOut:
+        log.warning("انتهت مهلة تأكيد ضغط زر في Telegram؛ سيستمر تنفيذ الإجراء")
+
+
+async def _ensure_db_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("db_user_id"):
+        return context.user_data["db_user_id"]
+    telegram_user = update.effective_user
+    if not telegram_user:
+        return None
+    user = await db.create_user(
+        telegram_user.id, telegram_user.username, telegram_user.first_name
+    )
+    context.user_data["db_user_id"] = user["id"]
+    return user["id"]
+
+
+async def _claim_side_effecting_update(update: Update, action: str) -> bool:
+    update_id = getattr(update, "update_id", None)
+    if type(update_id) is not int:
+        return True
+    return await db.claim_telegram_update(update_id, action)
+
+
+def _main_reply_keyboard(extra_rows=None):
+    rows = list(extra_rows or []) + [
+        ["🔎 أبحث عن عروض", "🛒 سوق الأفراد"],
+        ["🏪 صاحب نشاط تجاري", "📋 إعلاناتي"],
+        ["📊 إحصاءات الإعلانات", "🔄 تجديد الإعلان"],
+        ["↩️ رجوع", "🏠 القائمة الرئيسية"],
+        ["❌ إلغاء"],
+    ]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
+
+
+def _has_market_resume(context):
+    return any(context.user_data.get(key) for key in (
+        "market_draft", "market_city_id", "resubmitting_listing_id"
+    ))
+
+
+def _user_reply_keyboard(context):
+    rows = []
+    if context.user_data.get("pending_campaign") and context.user_data.get("campaign_preview_id"):
+        rows.append(["📄 متابعة معاينة الحملة"])
+    if _has_market_resume(context):
+        rows.append(["📄 متابعة مسودة الإعلان"])
+    return _main_reply_keyboard(rows or None)
+
+
+ROOT_KEYBOARD_TEXTS = (
+    "🔎 أبحث عن عروض", "🛒 سوق الأفراد", "🏪 صاحب نشاط تجاري", "📋 إعلاناتي",
+    "📊 إحصاءات الإعلانات", "🔄 تجديد الإعلان", "#إحصاء#", "#تجديد#",
+    "↩️ رجوع", "🏠 القائمة الرئيسية", "❌ إلغاء",
+    "📄 متابعة مسودة الإعلان",
+    "➕ إنشاء حملة", "📊 حالة حملاتي", "🎟️ تحقق من كود خصم", "🏪 حالة النشاط",
+    "📄 متابعة معاينة الحملة",
+    "ℹ️ كيف يعمل؟", "📞 تواصل معنا",
+)
+
+
+def _root_keyboard_filter():
+    labels = "|".join(re.escape(label) for label in ROOT_KEYBOARD_TEXTS)
+    return filters.Regex(rf"^(?:{labels})$")
+
+
 async def _invalidate_user_keyboard(context, key: str):
     reference = context.user_data.pop(key, None)
     if not reference or not getattr(context, "bot", None):
@@ -70,7 +145,7 @@ async def _clear_campaign_preview(context):
 
 
 async def _reject_stale_campaign_callback(query):
-    await query.answer("انتهت صلاحية هذا الزر؛ استخدم أزرار أحدث معاينة.", show_alert=True)
+    await _safe_answer(query, "انتهت صلاحية هذا الزر؛ استخدم أزرار أحدث معاينة.", show_alert=True)
     try:
         await query.edit_message_reply_markup(reply_markup=None)
     except Exception as exc:  # noqa: BLE001
@@ -119,6 +194,49 @@ BATCH_DELAY_SECONDS = _nonnegative_float_env("BROADCAST_BATCH_DELAY", 1.5)
 REDEEM_CODE = 10
 
 BIZ_TYPES = ["مطعم / كافيه", "متجر", "مركز تجميل", "خدمات"]
+CATEGORY_LABELS_AR = {
+    "FOOD": "مطاعم وكافيهات",
+    "SHOPPING": "تسوق",
+    "BEAUTY": "صحة وجمال",
+    "SERVICES": "خدمات",
+}
+CITY_LABELS_AR = {
+    "KHARTOUM": "الخرطوم",
+    "OMDURMAN": "أم درمان",
+    "BAHRI": "بحري",
+    "UNKNOWN": "غير محددة",
+}
+
+
+def _campaign_preview_text(pending):
+    data = pending["ai_data"]
+    category = pending.get("category_name") or CATEGORY_LABELS_AR.get(
+        str(data.get("category_code") or "").upper(), "فئة غير محددة"
+    )
+    city = pending.get("city_name") or CITY_LABELS_AR.get(
+        str(data.get("city_code") or "").upper(), "مدينة غير محددة"
+    )
+    start_value, end_value = db.normalize_campaign_date_values(
+        data.get("start"), data.get("end")
+    )
+    start_date, end_date = db.validate_campaign_dates(start_value, end_value)
+    start = start_date.isoformat() if start_date else None
+    end = end_date.isoformat() if end_date else None
+    if start and end:
+        period = f"{start} إلى {end} (شاملًا)"
+    elif start:
+        period = f"من {start} فصاعدًا"
+    elif end:
+        period = f"حتى {end} شاملًا"
+    else:
+        period = "دون تاريخ انتهاء محدد"
+    return (
+        f"📢 معاينة الإعلان:\n\n{pending['ad_text']}\n\n"
+        f"الفئة: {category} | المدينة: {city} | الخصم: {data.get('discount')}%\n"
+        f"فترة الصلاحية (UTC): {period}"
+    )
+
+
 MERCHANT_LAUNCH_PRICING_NOTICE = (
     "📣 تسجيل النشاط وإنشاء الحملات وإرسالها للمراجعة مجاني حاليًا خلال فترة الإطلاق المحدودة. "
     "ستُعلن أي باقات أو رسوم مستقبلية مسبقًا."
@@ -132,11 +250,7 @@ def is_admin(update: Update) -> bool:
 # =================================================================
 # /start — نقطة الدخول
 # =================================================================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tg_user = update.effective_user
-    user = await db.create_user(tg_user.id, tg_user.username, tg_user.first_name)
-    context.user_data["db_user_id"] = user["id"]
-
+def _main_inline_keyboard(update: Update, context: ContextTypes.DEFAULT_TYPE | None = None):
     keyboard = [
         [InlineKeyboardButton("🔎 أبحث عن عروض", callback_data="role_customer")],
         [InlineKeyboardButton("🛒 سوق الأفراد", callback_data="customer_market")],
@@ -144,32 +258,97 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("ℹ️ كيف يعمل؟", callback_data="how_it_works")],
         [InlineKeyboardButton("📞 تواصل معنا", callback_data="contact_us")],
     ]
+    if context and context.user_data.get("pending_campaign") and context.user_data.get("campaign_preview_id"):
+        keyboard.insert(0, [InlineKeyboardButton("📄 متابعة معاينة الحملة", callback_data="resume_campaign")])
+    if context and _has_market_resume(context):
+        keyboard.insert(0, [InlineKeyboardButton("📄 متابعة مسودة الإعلان", callback_data="resume_listing_flow")])
     if is_admin(update):
         keyboard.append([InlineKeyboardButton("🛠 لوحة الإدارة", callback_data="admin_menu")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg_user = update.effective_user
+    user = await db.create_user(tg_user.id, tg_user.username, tg_user.first_name)
+    context.user_data["db_user_id"] = user["id"]
+    context.user_data["navigation_section"] = "main"
+    context.user_data.pop("navigation_parent", None)
     await update.message.reply_text(
         "أهلاً بك في *عروض مدينتي* 👋\n\nاختر نوع حسابك:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=_main_inline_keyboard(update, context),
         parse_mode=ParseMode.MARKDOWN,
     )
     await update.message.reply_text(
         "يمكنك أيضًا استخدام القائمة العربية أسفل الشاشة للتنقل بسهولة.",
-        reply_markup=ReplyKeyboardMarkup(
-            [["🔎 أبحث عن عروض", "🛒 سوق الأفراد"], ["🏪 صاحب نشاط تجاري"], ["ℹ️ كيف يعمل؟", "📞 تواصل معنا"]],
-            resize_keyboard=True,
-            is_persistent=True,
-        ),
+        reply_markup=_user_reply_keyboard(context),
     )
     return SELECT_ROLE
+
+
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, notice=None):
+    await _ensure_db_user(update, context)
+    context.user_data["navigation_section"] = "main"
+    context.user_data.pop("navigation_parent", None)
+    text = notice or "🏠 القائمة الرئيسية\n\nاختر الإجراء المطلوب:"
+    query = update.callback_query
+    if query:
+        await _safe_answer(query)
+        await query.edit_message_text(text, reply_markup=_main_inline_keyboard(update, context))
+        await query.message.reply_text(
+            "استخدم الأزرار أسفل الشاشة للتنقل.", reply_markup=_user_reply_keyboard(context)
+        )
+    else:
+        await update.message.reply_text(
+            text, reply_markup=_user_reply_keyboard(context)
+        )
+    return SELECT_ROLE
+
+
+async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await show_main_menu(update, context)
 
 
 async def text_role_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """يعالج اختيارات القائمة النصية بدل إجبار المستخدم على كتابة أوامر."""
     text = (update.message.text or "").strip()
+    await _ensure_db_user(update, context)
+    if text == "🏠 القائمة الرئيسية":
+        return await show_main_menu(update, context)
+    if text == "↩️ رجوع":
+        parent = context.user_data.get("navigation_parent")
+        if parent == "market_menu":
+            return await marketplace.market_menu(update, context)
+        if parent == "merchant_menu":
+            return await show_merchant_menu(update, context)
+        if parent == "listings":
+            await cmd_my_listings(update, context)
+            return SELECT_ROLE
+        return await show_main_menu(update, context, "↩️ عدنا إلى القائمة الرئيسية.")
+    if text == "❌ إلغاء":
+        return await cancel(update, context)
+    if text == "📄 متابعة معاينة الحملة":
+        return await resume_campaign_preview(update, context)
+    if text == "📄 متابعة مسودة الإعلان":
+        return await marketplace.resume_listing_flow(update, context)
+    if text == "📋 إعلاناتي":
+        await cmd_my_listings(update, context)
+        return SELECT_ROLE
+    if text in {"#إحصاء#", "📊 إحصاءات الإعلانات"}:
+        await cmd_listing_stats(update, context)
+        return SELECT_ROLE
+    if text in {"#تجديد#", "🔄 تجديد الإعلان"}:
+        await cmd_renew_listing(update, context)
+        return SELECT_ROLE
+    if text in {"➕ إنشاء حملة", "📊 حالة حملاتي", "🎟️ تحقق من كود خصم", "🏪 حالة النشاط"}:
+        return await merchant_text_menu_router(update, context)
     if text == "🔎 أبحث عن عروض":
         await db.set_account_type(context.user_data["db_user_id"], "customer")
         cities = await db.list_cities()
         keyboard = [[InlineKeyboardButton(c["name"], callback_data=f"city_{c['id']}")] for c in cities]
+        keyboard.append([InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main_menu")])
         await update.message.reply_text("اختر مدينتك:", reply_markup=InlineKeyboardMarkup(keyboard))
+        context.user_data["navigation_section"] = "customer"
+        context.user_data["navigation_parent"] = "main"
         return CUST_CITY
     if text == "🏪 صاحب نشاط تجاري":
         await db.set_account_type(context.user_data["db_user_id"], "merchant")
@@ -186,20 +365,17 @@ async def text_role_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("للتواصل: @madinty_support")
         return SELECT_ROLE
     if text == "🛒 سوق الأفراد":
-        await update.message.reply_text(
-            "🛒 سوق الأفراد\n\nاختر العملية المطلوبة:",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🛍️ شراء", callback_data="market_buy")],
-                [InlineKeyboardButton("🏷️ بيع", callback_data="market_sell")],
-            ]),
-        )
-        return marketplace.MARKET_MENU
+        return await marketplace.market_menu(update, context)
     return SELECT_ROLE
 
 
 async def role_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    if query.data == "main_menu":
+        return await show_main_menu(update, context)
+
+    await _safe_answer(query)
+    await _ensure_db_user(update, context)
 
     if query.data == "admin_menu":
         if not is_admin(update):
@@ -223,7 +399,10 @@ async def role_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await db.set_account_type(context.user_data["db_user_id"], "customer")
         cities = await db.list_cities()
         keyboard = [[InlineKeyboardButton(c["name"], callback_data=f"city_{c['id']}")] for c in cities]
+        keyboard.append([InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main_menu")])
         await query.edit_message_text("اختر مدينتك:", reply_markup=InlineKeyboardMarkup(keyboard))
+        context.user_data["navigation_section"] = "customer"
+        context.user_data["navigation_parent"] = "main"
         return CUST_CITY
 
     if query.data == "role_merchant":
@@ -248,13 +427,14 @@ async def show_admin_menu(query):
             [InlineKeyboardButton("📦 إعلانات أفراد بانتظار المراجعة", callback_data="admin_listings")],
             [InlineKeyboardButton("📊 تقارير الوصول والتواصل", callback_data="admin_reports")],
             [InlineKeyboardButton("🔄 تحديث القائمة", callback_data="admin_menu")],
+            [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main_menu")],
         ]),
     )
 
 
 async def admin_reports_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     if not is_admin(update):
         await query.edit_message_text("غير مصرح لك باستخدام لوحة الإدارة.")
         return
@@ -282,7 +462,7 @@ async def admin_reports_callback(update: Update, context: ContextTypes.DEFAULT_T
 
 async def admin_pending_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     if not is_admin(update):
         await query.edit_message_text("غير مصرح لك باستخدام لوحة الإدارة.")
         return
@@ -309,7 +489,7 @@ async def admin_pending_callback(update: Update, context: ContextTypes.DEFAULT_T
 
 async def admin_pending_businesses_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     if not is_admin(update):
         await query.edit_message_text("غير مصرح لك باستخدام لوحة الإدارة.")
         return
@@ -340,7 +520,7 @@ async def admin_pending_businesses_callback(update: Update, context: ContextType
 
 async def admin_business_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     if not is_admin(update):
         await query.edit_message_text("غير مصرح لك باستخدام لوحة الإدارة.")
         return
@@ -375,7 +555,7 @@ async def admin_business_action(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def admin_listings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     if not is_admin(update):
         await query.edit_message_text("غير مصرح لك باستخدام لوحة الإدارة.")
         return
@@ -407,7 +587,7 @@ async def admin_listings_callback(update: Update, context: ContextTypes.DEFAULT_
 
 async def admin_listing_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     if not is_admin(update):
         await query.edit_message_text("غير مصرح لك باستخدام لوحة الإدارة.")
         return
@@ -436,16 +616,25 @@ async def admin_listing_action(update: Update, context: ContextTypes.DEFAULT_TYP
                     f"📦 الإعلان: {listing['title']}\n🔢 الرقم: #{listing_id}\n"
                     f"⏱ مدة الإعلان: 72 ساعة\n📅 تاريخ الانتهاء: {listing['expires_at']}\n\n"
                     f"📊 المشاهدات: {stats['views']}\n📩 مرات التواصل: {stats['contacts']}\n\n"
-                    "يمكنك متابعة الإحصاءات عبر /stats رقم_الإعلان، وتجديده عبر /renew رقم_الإعلان."
+                    "استخدم الأزرار أدناه لعرض الإحصاءات أو تجديد الإعلان."
                 )
+                reply_markup = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("📊 الإحصاءات", callback_data=f"mylisting_stats_{listing_id}"),
+                    InlineKeyboardButton("🔄 تجديد الإعلان", callback_data=f"mylisting_renew_{listing_id}"),
+                ], [InlineKeyboardButton("📋 إعلاناتي", callback_data="mylistings")]])
             else:
                 notice = (
                     f"❌ لم تتم الموافقة على إعلانك رقم #{listing_id}.\n"
-                    f"يمكنك تعديل بياناته وصورته ثم إعادة إرساله عبر الأمر /editlisting {listing_id}."
+                    "يمكنك تعديل بياناته وصورته ثم إعادة إرساله من الزر أدناه."
                 )
+                reply_markup = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✏️ تعديل الإعلان", callback_data=f"mylisting_edit_{listing_id}"),
+                    InlineKeyboardButton("📋 إعلاناتي", callback_data="mylistings"),
+                ]])
             await context.bot.send_message(
                 owner["telegram_id"],
                 notice,
+                reply_markup=reply_markup,
             )
     except Exception as exc:  # noqa: BLE001
         log.warning("تعذر إشعار صاحب الإعلان %s: %s", listing_id, exc)
@@ -478,7 +667,7 @@ async def notify_merchant_campaign_decision(context, campaign, status: str):
 
 async def admin_campaign_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     if not is_admin(update):
         await query.edit_message_text("غير مصرح لك باستخدام لوحة الإدارة.")
         return
@@ -506,7 +695,7 @@ async def admin_campaign_action(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def admin_send_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer("جارٍ التحقق من الحملة...")
+    await _safe_answer(query, "جارٍ التحقق من الحملة...")
     if not is_admin(update):
         await query.edit_message_text("غير مصرح لك باستخدام لوحة الإدارة.")
         return
@@ -523,17 +712,39 @@ async def admin_send_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 def _broadcast_result_text(campaign_id: int, result: dict) -> str:
     if result["status"] == "not_ready":
-        return "لم يبدأ الإرسال: الحملة غير معتمدة، غير صالحة، قيد الإرسال، أو سبق نشرها."
+        return (
+            "لم يبدأ الإرسال: الحملة غير معتمدة/غير صالحة أو ما زال عامل بث حديث نشطًا. "
+            f"للحملات المتوقفة استخدم /resume {campaign_id} بعد انتهاء مهلة الاستعادة."
+        )
     if result["status"] == "no_targets":
         return "لم يبدأ الإرسال لعدم وجود مستخدمين نشطين يطابقون المدينة والفئة. يمكنك إعادة المحاولة لاحقًا بعد انضمام مستلمين مناسبين."
     if result["status"] == "completed":
         text = f"✅ انتهت محاولة نشر الحملة #{campaign_id}. وصل الإرسال إلى {result['sent']} من {result['total']} مستخدم."
         if result["failed"]:
-            text += f"\nتعذر التسليم إلى {result['failed']} مستخدم؛ لن يُعاد الإرسال تلقائيًا منعًا للتكرار."
+            text += (
+                f"\nتعذر التسليم المؤكد أو بقيت النتيجة ملتبسة لدى {result['failed']} مستلم؛ "
+                "لن يعاد إرسال الملتبس تلقائيًا."
+            )
         return text
+    if result["status"] == "retryable":
+        return (
+            f"⚠️ بقي {result['pending']} مستلمًا دون نتيجة نهائية في الحملة #{campaign_id}. "
+            f"يمكن استئناف المستلمين المؤكد عدم إرسالهم بالأمر /resume {campaign_id}. "
+            f"النتائج الملتبسة ({result['uncertain']}) لن تعاد تلقائيًا."
+        )
+    if result["status"] == "finalization_failed":
+        return (
+            f"⚠️ اكتملت معالجة المستلمين لكن تعذر حفظ إنهاء الحملة #{campaign_id}. "
+            f"بعد استعادة قاعدة البيانات استخدم /resume {campaign_id}؛ لن يعاد إرسال المؤكد."
+        )
+    if result["status"] == "interrupted":
+        return (
+            f"⚠️ توقف بث الحملة #{campaign_id} أثناء المعالجة. قد تكون نتيجة آخر طلب Telegram ملتبسة، "
+            f"ولا يعاد إرسالها تلقائيًا. استخدم /resume {campaign_id} بعد انتهاء مهلة العامل."
+        )
     return (
         f"⚠️ تعذر إكمال نشر الحملة #{campaign_id}. وصل الإرسال إلى {result['sent']} من "
-        f"{result['total']} مستخدم. أُوقفت المحاولة لمنع التكرار؛ راجع السجلات قبل أي إعادة يدوية."
+        f"{result['total']} مستخدم. لا تعاد النتائج الملتبسة تلقائيًا."
     )
 
 
@@ -542,13 +753,27 @@ def _broadcast_result_text(campaign_id: int, result: dict) -> str:
 # =================================================================
 async def customer_city_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     city_id = int(query.data.split("_")[1])
     await db.set_user_city(context.user_data["db_user_id"], city_id)
-    context.user_data["selected_categories"] = set()
+    if context.user_data.get("customer_city_id") != city_id:
+        context.user_data["selected_categories"] = set()
+    context.user_data["customer_city_id"] = city_id
 
     await render_category_picker(query, context)
     return CUST_CATEGORIES
+
+
+async def customer_city_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await _safe_answer(query)
+    cities = await db.list_cities()
+    keyboard = [[InlineKeyboardButton(c["name"], callback_data=f"city_{c['id']}")] for c in cities]
+    keyboard.append([InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main_menu")])
+    await query.edit_message_text("اختر مدينتك:", reply_markup=InlineKeyboardMarkup(keyboard))
+    context.user_data["navigation_section"] = "customer"
+    context.user_data["navigation_parent"] = "main"
+    return CUST_CITY
 
 
 async def render_category_picker(query, context):
@@ -559,6 +784,8 @@ async def render_category_picker(query, context):
         mark = "✅ " if c["id"] in selected else ""
         keyboard.append([InlineKeyboardButton(f"{mark}{c['name']}", callback_data=f"cat_{c['id']}")])
     keyboard.append([InlineKeyboardButton("✔️ تأكيد الاشتراك", callback_data="cat_confirm")])
+    keyboard.append([InlineKeyboardButton("↩️ تغيير المدينة", callback_data="customer_city_back")])
+    keyboard.append([InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main_menu")])
     await query.edit_message_text(
         "اختر اهتماماتك (يمكن اختيار أكثر من واحد):",
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -567,13 +794,13 @@ async def render_category_picker(query, context):
 
 async def customer_category_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
 
     if query.data == "cat_confirm":
         selected = context.user_data.get("selected_categories", set())
         if not selected:
-            await query.answer("اختر فئة واحدة على الأقل", show_alert=True)
+            await _safe_answer(query, "اختر فئة واحدة على الأقل", show_alert=True)
             return CUST_CATEGORIES
+        await _safe_answer(query)
         await db.set_user_categories(context.user_data["db_user_id"], list(selected))
         await query.edit_message_text(
             "🎉 تم تسجيل تفضيلاتك بنجاح!"
@@ -600,10 +827,12 @@ async def customer_category_toggle(update: Update, context: ContextTypes.DEFAULT
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🏪 دليل الأنشطة", callback_data="customer_directory")],
                 [InlineKeyboardButton("🛒 سوق الأفراد", callback_data="customer_market")],
+                [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main_menu")],
             ]),
         )
         return ConversationHandler.END
 
+    await _safe_answer(query)
     cat_id = int(query.data.split("_")[1])
     selected = context.user_data.setdefault("selected_categories", set())
     if cat_id in selected:
@@ -626,7 +855,7 @@ async def merchant_biz_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def merchant_biz_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     context.user_data["biz_type"] = query.data.split("_", 1)[1]
     cities = await db.list_cities()
     keyboard = [[InlineKeyboardButton(c["name"], callback_data=f"bizcity_{c['id']}")] for c in cities]
@@ -636,7 +865,7 @@ async def merchant_biz_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def merchant_biz_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     context.user_data["biz_city_id"] = int(query.data.split("_")[1])
     await query.edit_message_text("ما رقم التواصل (واتساب/هاتف)؟")
     return MER_BIZ_PHONE
@@ -661,6 +890,8 @@ async def merchant_biz_phone(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def show_merchant_menu(update_or_query, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["navigation_section"] = "merchant"
+    context.user_data["navigation_parent"] = "main"
     business = await db.get_business_by_user(context.user_data["db_user_id"])
     approved = business and business["status"] == "approved"
     if approved:
@@ -671,13 +902,14 @@ async def show_merchant_menu(update_or_query, context: ContextTypes.DEFAULT_TYPE
         ]
         text = f"لوحة التاجر — ماذا تريد أن تفعل؟\n\n{MERCHANT_LAUNCH_PRICING_NOTICE}"
         reply_rows = [["➕ إنشاء حملة", "📊 حالة حملاتي"], ["🎟️ تحقق من كود خصم"]]
+        if context.user_data.get("pending_campaign"):
+            keyboard.insert(0, [InlineKeyboardButton("📄 متابعة معاينة الحملة", callback_data="resume_campaign")])
+            reply_rows.insert(0, ["📄 متابعة معاينة الحملة"])
     else:
         keyboard = [[InlineKeyboardButton("🏪 حالة مراجعة النشاط", callback_data="business_status")]]
         text = _business_status_text(business)
         reply_rows = [["🏪 حالة النشاط"]]
-    reply_keyboard = ReplyKeyboardMarkup(
-        reply_rows + [["🏠 القائمة الرئيسية"]], resize_keyboard=True, is_persistent=True
-    )
+    reply_keyboard = _main_reply_keyboard(reply_rows)
     if hasattr(update_or_query, "message") and update_or_query.message is None:
         await update_or_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
         await update_or_query.message.reply_text("استخدم القائمة أسفل الشاشة للتعامل مع البوت.", reply_markup=reply_keyboard)
@@ -685,6 +917,41 @@ async def show_merchant_menu(update_or_query, context: ContextTypes.DEFAULT_TYPE
         target = update_or_query.message if hasattr(update_or_query, "message") else update_or_query
         await target.reply_text(text, reply_markup=reply_keyboard)
     return MER_MENU
+
+
+async def merchant_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await _safe_answer(query)
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("تعذر إزالة أزرار لوحة التاجر القديمة: %s", exc)
+    return await show_merchant_menu(query, context)
+
+
+def _campaign_draft_warning_markup(preview_id: str):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📄 متابعة المعاينة الحالية", callback_data="resume_campaign")],
+        [InlineKeyboardButton(
+            "🗑️ إلغاء المعاينة وبدء حملة جديدة",
+            callback_data=f"new_campaign_discard_{preview_id}",
+        )],
+        [InlineKeyboardButton("↩️ لوحة التاجر", callback_data="merchant_menu")],
+    ])
+
+
+def _campaign_draft_warning_text(pending):
+    title = (pending.get("ai_data") or {}).get("title") or "الحملة الحالية"
+    return f"لديك معاينة حملة غير مرسلة: {title}. لم أستبدلها؛ استأنفها أو ألغها صراحةً قبل بدء حملة جديدة."
+
+
+def _ensure_campaign_preview_id(context, pending):
+    preview_id = pending.get("preview_id")
+    if not isinstance(preview_id, str) or not re.fullmatch(r"[0-9a-f]{12}", preview_id):
+        preview_id = uuid4().hex[:12]
+        pending["preview_id"] = preview_id
+    context.user_data["campaign_preview_id"] = preview_id
+    return preview_id
 
 
 def _business_status_text(business) -> str:
@@ -699,12 +966,41 @@ def _business_status_text(business) -> str:
 
 async def merchant_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
 
-    if query.data == "new_campaign":
+    if query.data.startswith("new_campaign_discard_"):
+        requested_id = query.data.rsplit("_", 1)[-1]
+        pending = context.user_data.get("pending_campaign")
+        expected_id = context.user_data.get("campaign_preview_id")
+        if not pending or not expected_id or requested_id != expected_id or pending.get("preview_id") != expected_id:
+            await query.edit_message_text("انتهت صلاحية هذا الإجراء؛ لم تُحذف أي معاينة.")
+            return MER_MENU
         business = await db.get_business_by_user(context.user_data["db_user_id"])
         if not business or business["status"] != "approved":
             await query.edit_message_text(_business_status_text(business))
+            return MER_MENU
+        await _clear_campaign_preview(context)
+        context.user_data.pop("pending_campaign", None)
+        context.user_data["navigation_parent"] = "merchant_menu"
+        await query.edit_message_text(
+            f"{MERCHANT_LAUNCH_PRICING_NOTICE}\n\n"
+            "أُلغيت المعاينة غير المرسلة فقط. ✍️ اكتب وصف الحملة الجديدة الآن."
+        )
+        return CAMPAIGN_DESC
+
+    if query.data == "new_campaign":
+        context.user_data["navigation_parent"] = "merchant_menu"
+        business = await db.get_business_by_user(context.user_data["db_user_id"])
+        if not business or business["status"] != "approved":
+            await query.edit_message_text(_business_status_text(business))
+            return MER_MENU
+        pending = context.user_data.get("pending_campaign")
+        if isinstance(pending, dict):
+            preview_id = _ensure_campaign_preview_id(context, pending)
+            await query.edit_message_text(
+                _campaign_draft_warning_text(pending),
+                reply_markup=_campaign_draft_warning_markup(preview_id),
+            )
             return MER_MENU
         await _clear_campaign_preview(context)
         context.user_data.pop("pending_campaign", None)
@@ -716,6 +1012,7 @@ async def merchant_menu_router(update: Update, context: ContextTypes.DEFAULT_TYP
         return CAMPAIGN_DESC
 
     if query.data == "redeem_menu":
+        context.user_data["navigation_parent"] = "merchant_menu"
         business = await db.get_business_by_user(context.user_data["db_user_id"])
         if not business or business["status"] != "approved":
             await query.edit_message_text(_business_status_text(business))
@@ -740,7 +1037,7 @@ async def merchant_menu_router(update: Update, context: ContextTypes.DEFAULT_TYP
         if not rows:
             await query.edit_message_text("لا توجد حملات بعد.")
         else:
-            lines = [f"#{r['id']} — {r['title']} — {r['status']}" for r in rows]
+            lines = [f"#{r['id']} — {r['title']} — {_status_ar(r['status'])}" for r in rows]
             await query.edit_message_text("حملاتك:\n" + "\n".join(lines))
         return MER_MENU
 
@@ -751,9 +1048,18 @@ async def merchant_text_menu_router(update: Update, context: ContextTypes.DEFAUL
     """نفس خيارات لوحة التاجر لكن من لوحة المفاتيح العربية."""
     text = (update.message.text or "").strip()
     if text == "➕ إنشاء حملة":
+        context.user_data["navigation_parent"] = "merchant_menu"
         business = await db.get_business_by_user(context.user_data["db_user_id"])
         if not business or business["status"] != "approved":
             await update.message.reply_text(_business_status_text(business))
+            return MER_MENU
+        pending = context.user_data.get("pending_campaign")
+        if isinstance(pending, dict):
+            preview_id = _ensure_campaign_preview_id(context, pending)
+            await update.message.reply_text(
+                _campaign_draft_warning_text(pending),
+                reply_markup=_campaign_draft_warning_markup(preview_id),
+            )
             return MER_MENU
         await _clear_campaign_preview(context)
         context.user_data.pop("pending_campaign", None)
@@ -774,11 +1080,17 @@ async def merchant_text_menu_router(update: Update, context: ContextTypes.DEFAUL
         if not rows:
             await update.message.reply_text("لا توجد حملات بعد.")
         else:
-            lines = [f"#{r['id']} — {r['title']} — {r['status']}" for r in rows]
+            lines = [f"#{r['id']} — {r['title']} — {_status_ar(r['status'])}" for r in rows]
             await update.message.reply_text("حملاتك:\n" + "\n".join(lines))
         return MER_MENU
-    if text == "🏠 القائمة الرئيسية":
-        return await start(update, context)
+    if text == "🎟️ تحقق من كود خصم":
+        business = await db.get_business_by_user(context.user_data["db_user_id"])
+        if not business or business["status"] != "approved":
+            await update.message.reply_text(_business_status_text(business))
+            return MER_MENU
+        context.user_data["navigation_parent"] = "merchant_menu"
+        await update.message.reply_text("🎟️ أرسل كود الخصم الذي قدمه لك العميل للتحقق منه:")
+        return REDEEM_CODE
     if text == "🏪 حالة النشاط":
         business = await db.get_business_by_user(context.user_data["db_user_id"])
         await update.message.reply_text(_business_status_text(business))
@@ -814,14 +1126,15 @@ async def merchant_redeem_code_received(update: Update, context: ContextTypes.DE
 async def merchant_redeem_prompt_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """مسار احتياطي إذا ضغط التاجر الزر بعد انتهاء حالة المحادثة."""
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     user = await db.get_user_by_telegram_id(update.effective_user.id)
     business = await db.get_business_by_user(user["id"]) if user else None
     if not business:
         await query.edit_message_text("لا يوجد نشاط تجاري مسجل لهذا الحساب.")
-        return
+        return MER_MENU
     await query.edit_message_text("🎟️ أرسل كود الخصم الذي قدمه لك العميل للتحقق منه:")
-    context.user_data["awaiting_redeem_code"] = True
+    context.user_data["navigation_parent"] = "merchant_menu"
+    return REDEEM_CODE
 
 
 async def merchant_redeem_keyboard_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -866,7 +1179,17 @@ async def campaign_description_received(update: Update, context: ContextTypes.DE
     raw_text = update.message.text.strip()
     await update.message.reply_text("⏳ جارٍ تحليل العرض بواسطة الذكاء الاصطناعي...")
 
-    data = await ai.extract_campaign_data(raw_text)
+    data = dict(await ai.extract_campaign_data(raw_text))
+    data["start"], data["end"] = db.normalize_campaign_date_values(
+        data.get("start"), data.get("end")
+    )
+    try:
+        db.validate_campaign_dates(data.get("start"), data.get("end"))
+    except ValueError:
+        await update.message.reply_text(
+            "⚠️ تاريخ الحملة غير صالح. استخدم YYYY-MM-DD، واجعل تاريخ النهاية في أو بعد تاريخ البداية."
+        )
+        return CAMPAIGN_DESC
     if data.get("issues"):
         issues_text = "\n".join(f"- {i}" for i in data["issues"])
         await update.message.reply_text(
@@ -895,22 +1218,55 @@ async def campaign_description_received(update: Update, context: ContextTypes.DE
     await _clear_campaign_preview(context)
     preview_id = uuid4().hex[:12]
     context.user_data["pending_campaign"] = {
-        "raw": raw_text, "ai_data": data, "ad_text": ad_text, "preview_id": preview_id
+        "raw": raw_text, "ai_data": data, "ad_text": ad_text, "preview_id": preview_id,
+        "submission_key": uuid4().hex,
     }
 
     preview_message = await update.message.reply_text(
-        f"📢 معاينة الإعلان:\n\n{ad_text}\n\n"
-        f"الفئة: {data.get('category_code')} | المدينة: {data.get('city_code')} | "
-        f"الخصم: {data.get('discount')}%",
+        _campaign_preview_text(context.user_data["pending_campaign"]),
         reply_markup=InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("✅ إرسال للمراجعة", callback_data=f"campaign_{preview_id}_submit")],
                 [InlineKeyboardButton("✏️ إعادة الكتابة", callback_data=f"campaign_{preview_id}_rewrite")],
+                [InlineKeyboardButton("↩️ لوحة التاجر", callback_data="merchant_menu"),
+                 InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main_menu")],
             ]
         ),
     )
     context.user_data["campaign_preview_id"] = preview_id
     reference = _callback_message_reference(preview_message, update.effective_chat.id)
+    if reference:
+        context.user_data["campaign_preview_message"] = reference
+    return CAMPAIGN_CONFIRM
+
+
+async def resume_campaign_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await _safe_answer(query)
+    pending = context.user_data.get("pending_campaign")
+    preview_id = context.user_data.get("campaign_preview_id")
+    if not pending or not preview_id or pending.get("preview_id") != preview_id:
+        text = "لا توجد معاينة محفوظة لاستئنافها. يمكنك إنشاء حملة جديدة من لوحة التاجر."
+        if query:
+            await query.edit_message_text(text)
+        else:
+            await update.message.reply_text(text)
+        return MER_MENU
+    context.user_data["navigation_parent"] = "merchant_menu"
+    text = _campaign_preview_text(pending)
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ إرسال للمراجعة", callback_data=f"campaign_{preview_id}_submit")],
+        [InlineKeyboardButton("✏️ إعادة الكتابة", callback_data=f"campaign_{preview_id}_rewrite")],
+        [InlineKeyboardButton("↩️ لوحة التاجر", callback_data="merchant_menu"),
+         InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main_menu")],
+    ])
+    if query:
+        preview_message = await query.edit_message_text(text, reply_markup=markup)
+    else:
+        preview_message = await update.message.reply_text(text, reply_markup=markup)
+    chat = update.effective_chat
+    reference = _callback_message_reference(preview_message, chat.id if chat else None)
     if reference:
         context.user_data["campaign_preview_message"] = reference
     return CAMPAIGN_CONFIRM
@@ -931,7 +1287,7 @@ async def campaign_confirm_router(update: Update, context: ContextTypes.DEFAULT_
     ):
         await _reject_stale_campaign_callback(query)
         return CAMPAIGN_CONFIRM if pending else MER_MENU
-    await query.answer()
+    await _safe_answer(query)
 
     if action == "rewrite":
         context.user_data.pop("pending_campaign", None)
@@ -976,20 +1332,25 @@ async def campaign_confirm_router(update: Update, context: ContextTypes.DEFAULT_
         ad_text=pending["ad_text"],
         category_id=category_row["id"] if category_row else None,
         city_id=city_row["id"] if city_row else None,
+        submission_key=pending.get("submission_key") or pending.get("preview_id"),
     )
-    context.user_data.pop("pending_campaign", None)
-    context.user_data.pop("campaign_preview_id", None)
-    context.user_data.pop("campaign_preview_message", None)
     if not campaign:
+        context.user_data.pop("pending_campaign", None)
+        context.user_data.pop("campaign_preview_id", None)
+        context.user_data.pop("campaign_preview_message", None)
         await query.edit_message_text(
             "⚠️ لم تُحفظ الحملة لأن النشاط غير معتمد أو أن هدفها لم يعد صالحًا."
         )
         return await show_merchant_menu(query, context)
 
+    if campaign.get("_created", True):
+        await notify_admins_new_campaign(context, campaign["id"])
     await query.edit_message_text(
         f"✅ تم إرسال الحملة #{campaign['id']} لمراجعة الإدارة. سنبلغك عند اعتمادها."
     )
-    await notify_admins_new_campaign(context, campaign["id"])
+    context.user_data.pop("pending_campaign", None)
+    context.user_data.pop("campaign_preview_id", None)
+    context.user_data.pop("campaign_preview_message", None)
     return await show_merchant_menu(query, context)
 
 
@@ -998,7 +1359,10 @@ async def notify_admins_new_campaign(context: ContextTypes.DEFAULT_TYPE, campaig
         try:
             await context.bot.send_message(
                 admin_id,
-                f"🆕 حملة جديدة بانتظار المراجعة: #{campaign_id}\nاستخدم /pending لعرض التفاصيل.",
+                f"🆕 حملة جديدة بانتظار المراجعة: #{campaign_id}",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("📋 مراجعة الحملات", callback_data="admin_pending")
+                ]]),
             )
         except Exception as e:  # noqa: BLE001
             log.warning("تعذر إشعار الأدمن %s: %s", admin_id, e)
@@ -1009,8 +1373,10 @@ async def notify_admins_new_business(context: ContextTypes.DEFAULT_TYPE, busines
         try:
             await context.bot.send_message(
                 admin_id,
-                f"🏪 نشاط جديد بانتظار المراجعة: #{business_id} — {name}\n"
-                "راجع لوحة الإدارة من /start ← نشاطات بانتظار المراجعة.",
+                f"🏪 نشاط جديد بانتظار المراجعة: #{business_id} — {name}",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🏪 مراجعة الأنشطة", callback_data="admin_businesses")
+                ]]),
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("تعذر إشعار الأدمن %s عن النشاط %s: %s", admin_id, business_id, exc)
@@ -1024,14 +1390,25 @@ async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     rows = await db.list_pending_campaigns()
     if not rows:
-        await update.message.reply_text("لا توجد حملات بانتظار المراجعة.")
+        await update.message.reply_text(
+            "لا توجد حملات بانتظار المراجعة.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 لوحة الإدارة", callback_data="admin_menu")]]),
+        )
         return
     for r in rows:
+        start = r["start_date"] or "بلا بداية محددة"
+        end = r["end_date"] or "مفتوحة النهاية"
         text = (
-            f"#{r['id']} — {r['business_name']}\n{r['description']}\n\n"
-            f"/approve_{r['id']}  /reject_{r['id']}"
+            f"#{r['id']} — {r['business_name']}\n"
+            f"فترة الصلاحية UTC: {start} — {end}\n{r['description']}"
         )
-        await update.message.reply_text(text)
+        await update.message.reply_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ اعتماد", callback_data=f"admin_approve_{r['id']}"),
+                InlineKeyboardButton("❌ رفض", callback_data=f"admin_reject_{r['id']}"),
+            ]]),
+        )
 
 
 async def cmd_approve_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1042,7 +1419,7 @@ async def cmd_approve_reject(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         campaign_id = int(campaign_id_str)
     except ValueError:
-        await update.message.reply_text("صيغة غير صحيحة. استخدم /approve_123 أو /reject_123")
+        await update.message.reply_text("تعذر قراءة رقم الحملة. استخدم أزرار الاعتماد أو الرفض من قائمة المراجعة.")
         return
 
     campaign = await db.review_campaign(campaign_id, action)
@@ -1053,11 +1430,14 @@ async def cmd_approve_reject(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     status = "approved" if action == "approve" else "rejected"
-    await update.message.reply_text(f"تم تحديث الحملة #{campaign_id} إلى: {status}")
+    await update.message.reply_text(f"تم تحديث الحملة #{campaign_id}: {_status_ar(status)}")
     await notify_merchant_campaign_decision(context, campaign, status)
 
     if status == "approved":
-        await update.message.reply_text(f"لنشر الحملة الآن استخدم: /send_{campaign_id}")
+        await update.message.reply_text(
+            "يمكنك نشر الحملة الآن من الزر أدناه:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📣 نشر الحملة", callback_data=f"admin_send_{campaign_id}")]]),
+        )
 
 
 async def cmd_send_campaign(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1069,11 +1449,29 @@ async def cmd_send_campaign(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         campaign_id = int(campaign_id_str)
     except ValueError:
-        await update.message.reply_text("صيغة غير صحيحة. استخدم /send_123")
+        await update.message.reply_text("تعذر قراءة رقم الحملة. اختر حملة معتمدة من أزرار لوحة الإدارة.")
         return
 
     result = await campaign_broadcast.broadcast_campaign(
         context.bot, campaign_id, BATCH_SIZE, BATCH_DELAY_SECONDS
+    )
+    await update.message.reply_text(_broadcast_result_text(campaign_id, result))
+
+
+async def cmd_resume_campaign(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Resume only pending recipients; ambiguous Telegram outcomes remain skipped."""
+    if not is_admin(update):
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("الاستخدام: /resume رقم_الحملة")
+        return
+    try:
+        campaign_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("رقم الحملة يجب أن يكون عددًا صحيحًا.")
+        return
+    result = await campaign_broadcast.broadcast_campaign(
+        context.bot, campaign_id, BATCH_SIZE, BATCH_DELAY_SECONDS, resume=True
     )
     await update.message.reply_text(_broadcast_result_text(campaign_id, result))
 
@@ -1083,7 +1481,7 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     parts = update.message.text.split()
     if len(parts) != 2:
-        await update.message.reply_text("الاستخدام: /report <رقم الحملة>")
+        await update.message.reply_text("أدخل رقم الحملة المطلوبة لعرض تقريرها.")
         return
     try:
         campaign_id = int(parts[1])
@@ -1108,27 +1506,49 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =================================================================
 async def get_discount_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     try:
         campaign_id = int(query.data.split("_")[1])
     except (IndexError, ValueError):
-        await query.answer("تعذر قراءة الحملة.", show_alert=True)
+        await query.message.reply_text("تعذر قراءة الحملة. اطلب عرضًا أحدث وحاول مرة أخرى.")
         return
 
+    await _ensure_db_user(update, context)
     user_row = await db.get_user_by_telegram_id(update.effective_user.id)
     if not user_row:
-        await query.answer("الرجاء بدء البوت أولاً بالأمر /start", show_alert=True)
+        await query.message.reply_text("تعذر تسجيل حسابك مؤقتًا. اضغط زر القائمة الرئيسية ثم حاول مجددًا.")
         return
 
     campaign = await db.get_campaign(campaign_id)
     if not campaign or campaign["status"] not in {"active", "sending", "broadcast_failed"}:
-        await query.answer("هذا العرض غير متاح حاليًا.", show_alert=True)
+        await query.message.reply_text("هذا العرض غير متاح حاليًا.")
         return
     city_row = await db.pool().fetchrow("SELECT code FROM cities WHERE id=$1", campaign["city_id"])
     city_code = city_row["code"] if city_row else "OFFER"
 
-    await db.log_event(campaign_id, user_row["id"], "CLICKED")
-    code_row = await db.create_discount_code(campaign_id, user_row["id"], city_code)
+    update_id = getattr(update, "update_id", None)
+    claimed = await _claim_side_effecting_update(update, "get_discount_code")
+    if not claimed:
+        return
+    try:
+        if type(update_id) is int:
+            receipt = await db.get_telegram_update_receipt(update_id)
+            if not receipt or receipt["stage"] != "notification_sent":
+                await db.log_campaign_event_for_update(
+                    campaign_id, user_row["id"], "CLICKED", update_id, "get_discount_code"
+                )
+        else:
+            await db.log_event(campaign_id, user_row["id"], "CLICKED")
+        code_row = await db.create_discount_code(campaign_id, user_row["id"], city_code)
+        if type(update_id) is int:
+            await db.complete_telegram_update(update_id, "get_discount_code")
+    except Exception:
+        if type(update_id) is int:
+            await db.release_telegram_update(update_id, "get_discount_code")
+        raise
+    if not code_row:
+        await query.message.reply_text("هذا العرض لم يبدأ بعد أو انتهت صلاحيته، ولا يمكن إصدار كود جديد.")
+        return
 
     await query.message.reply_text(
         f"🎁 كودك: `{code_row['code']}`\nقدّمه للتاجر عند الشراء للاستفادة من الخصم.",
@@ -1138,7 +1558,7 @@ async def get_discount_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def customer_directory_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     user = await db.get_user_by_telegram_id(update.effective_user.id)
     businesses = await db.list_public_businesses(user["city_id"] if user else None)
     if not businesses:
@@ -1161,34 +1581,79 @@ async def customer_directory_callback(update: Update, context: ContextTypes.DEFA
 
 async def listing_contact_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     try:
         listing_id = int(query.data.rsplit("_", 1)[1])
     except (ValueError, IndexError):
         await query.edit_message_text("تعذر قراءة الإعلان.")
         return
-    listing = await db.get_listing(listing_id)
+    listing = await db.get_public_listing(listing_id)
     buyer = await db.get_user_by_telegram_id(update.effective_user.id)
-    if not listing or listing["status"] != "approved":
-        await query.answer("الإعلان غير متاح حاليًا.", show_alert=True)
+    if not listing:
+        await query.message.reply_text("الإعلان غير متاح حاليًا.")
         return
-    owner = await db.get_user_by_id(listing["user_id"])
-    await db.log_listing_event(listing_id, buyer["id"] if buyer else None, "CONTACT")
-    if owner:
-        await context.bot.send_message(
-            owner["telegram_id"],
-            f"📩 يوجد مستخدم مهتم بإعلانك #{listing_id}: {listing['title']}\n"
-            "يمكنك التواصل معه عبر Telegram.",
+    update_id = getattr(update, "update_id", None)
+    claimed = await _claim_side_effecting_update(update, "listing_contact")
+    if not claimed:
+        await query.message.reply_text("تمت معالجة طلب التواصل هذا مسبقًا.")
+        return
+    try:
+        owner = await db.get_user_by_id(listing["user_id"])
+        receipt = (
+            await db.get_telegram_update_receipt(update_id)
+            if type(update_id) is int else None
         )
-    await query.message.reply_text(
-        f"رقم التواصل مع المعلن: {listing['contact'] or 'غير مسجل'}\n"
-        f"حساب Telegram: {('@' + owner['username']) if owner and owner['username'] else 'غير متاح'}"
-    )
+        stage = receipt["stage"] if receipt else None
+        uncertain_notification = stage == "notification_attempting"
+        if stage not in {"notification_attempting", "notification_sent"}:
+            if type(update_id) is int:
+                await db.log_listing_contact_for_update(
+                    listing_id, buyer["id"] if buyer else None, update_id
+                )
+            else:
+                await db.log_listing_event(listing_id, buyer["id"] if buyer else None, "CONTACT")
+            if owner:
+                if type(update_id) is int:
+                    if not await db.set_telegram_update_stage(
+                        update_id, "listing_contact", "notification_attempting"
+                    ):
+                        raise RuntimeError("Contact update is no longer processing")
+                try:
+                    await context.bot.send_message(
+                        owner["telegram_id"],
+                        f"📩 يوجد مستخدم مهتم بإعلانك #{listing_id}: {listing['title']}\n"
+                        "يمكنك التواصل معه عبر تيليجرام.",
+                    )
+                except Exception as exc:
+                    # Keep the notification unconfirmed; retry details only, never the owner notice.
+                    uncertain_notification = type(update_id) is int
+                    log.warning("تعذر تأكيد إشعار التواصل للإعلان %s: %s", listing_id, exc)
+                else:
+                    if type(update_id) is int and not await db.set_telegram_update_stage(
+                        update_id, "listing_contact", "notification_sent"
+                    ):
+                        raise RuntimeError("Contact notice sent but update stage was not saved")
+        # Telegram has no idempotency key: if this reply times out after delivery,
+        # a resumed attempt can repeat the details message, but not the DB event or owner notice.
+        await query.message.reply_text(
+            f"رقم التواصل مع المعلن: {listing['contact'] or 'غير مسجل'}\n"
+            f"حساب تيليجرام: {('@' + owner['username']) if owner and owner['username'] else 'غير متاح'}"
+        )
+        if type(update_id) is int:
+            if uncertain_notification:
+                if not await db.mark_telegram_update_uncertain(update_id, "listing_contact"):
+                    raise RuntimeError("Unconfirmed contact notice could not be recorded")
+            elif not await db.complete_telegram_update(update_id, "listing_contact"):
+                raise RuntimeError("Contact details sent but update completion was not saved")
+    except Exception:
+        if type(update_id) is int:
+            await db.release_telegram_update(update_id, "listing_contact")
+        raise
 
 
 async def business_contact_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     try:
         business_id = int(query.data.rsplit("_", 1)[1])
     except (ValueError, IndexError):
@@ -1197,9 +1662,25 @@ async def business_contact_callback(update: Update, context: ContextTypes.DEFAUL
     business = await db.get_business(business_id)
     buyer = await db.get_user_by_telegram_id(update.effective_user.id)
     if not business:
-        await query.answer("النشاط غير متاح حاليًا.", show_alert=True)
+        await query.message.reply_text("النشاط غير متاح حاليًا.")
         return
-    await db.log_business_event(business_id, buyer["id"] if buyer else None, "CONTACT")
+    update_id = getattr(update, "update_id", None)
+    claimed = await _claim_side_effecting_update(update, "business_contact")
+    if not claimed:
+        await query.message.reply_text("تمت معالجة طلب التواصل هذا مسبقًا.")
+        return
+    try:
+        if type(update_id) is int:
+            await db.log_business_contact_for_update(
+                business_id, buyer["id"] if buyer else None, update_id
+            )
+            await db.complete_telegram_update(update_id, "business_contact")
+        else:
+            await db.log_business_event(business_id, buyer["id"] if buyer else None, "CONTACT")
+    except Exception:
+        if type(update_id) is int:
+            await db.release_telegram_update(update_id, "business_contact")
+        raise
     await query.message.reply_text(
         f"للتواصل مع {business['business_name']}: {business['phone'] or 'لا يوجد رقم مسجل'}"
     )
@@ -1209,7 +1690,7 @@ async def cmd_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """يستخدمها التاجر/الموظف: /redeem KHART-8F21"""
     parts = update.message.text.split()
     if len(parts) != 2:
-        await update.message.reply_text("الاستخدام: /redeem <الكود>")
+        await update.message.reply_text("أرسل كود الخصم وحده بعد اختيار «التحقق من كود خصم».")
         return
     if not (is_admin(update) or (update.effective_user and await db.get_business_by_user(
         (await db.get_user_by_telegram_id(update.effective_user.id)) or {"id": None}
@@ -1228,32 +1709,213 @@ async def cmd_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ الكود غير صالح أو مستخدم مسبقاً.")
 
 
-async def cmd_my_listings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = await db.get_user_by_telegram_id(update.effective_user.id)
-    rows = await db.list_user_listings(user["id"]) if user else []
-    if not rows:
-        await update.message.reply_text("لا توجد إعلانات مرتبطة بحسابك.")
-        return
-    lines = ["📋 إعلاناتك:"]
-    for row in rows:
-        stats = await db.listing_report(row["id"])
-        lines.append(
-            f"#{row['id']} — {row['title']} — {row['status']}\n"
-            f"المشاهدات: {stats['views']} | مشاهدون: {stats['unique_viewers']} | تواصل: {stats['contacts']}"
+def _status_ar(status: str) -> str:
+    return {
+        "pending": "بانتظار المراجعة",
+        "pending_review": "بانتظار المراجعة",
+        "approved": "معتمد",
+        "active": "نشط",
+        "sending": "قيد الإرسال",
+        "broadcast_failed": "تعذر الإرسال",
+        "rejected": "مرفوض",
+        "expired": "منتهي",
+        "sold": "تم البيع",
+        "draft": "مسودة",
+    }.get(status, "غير معروف")
+
+
+def _listing_actions_markup(row, include_actions=True):
+    listing_id = row["id"]
+    keyboard = [[InlineKeyboardButton("📊 الإحصاءات", callback_data=f"mylisting_stats_{listing_id}")]]
+    if include_actions:
+        actions = []
+        if row["status"] in {"approved", "expired"} and (row.get("image_file_ids") or []):
+            actions.append(InlineKeyboardButton("🔄 تجديد الإعلان", callback_data=f"mylisting_renew_{listing_id}"))
+        if row["status"] in {"approved", "pending_review"}:
+            actions.append(InlineKeyboardButton("✅ تم البيع", callback_data=f"mylisting_sold_{listing_id}"))
+        if row["status"] == "rejected":
+            actions.append(InlineKeyboardButton("✏️ تعديل", callback_data=f"mylisting_edit_{listing_id}"))
+        if actions:
+            keyboard.append(actions)
+    keyboard.append([
+        InlineKeyboardButton("📋 إعلاناتي", callback_data="mylistings"),
+        InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main_menu"),
+    ])
+    return InlineKeyboardMarkup(keyboard)
+
+
+LISTINGS_PAGE_SIZE = 10
+
+
+async def _show_user_listings(update, context, mode="list", cursor_id=None, direction="next"):
+    user_id = await _ensure_db_user(update, context)
+    if user_id:
+        rows, has_previous, has_next = await db.list_user_listings_page(
+            user_id, mode=mode, cursor_id=cursor_id, direction=direction,
+            limit=LISTINGS_PAGE_SIZE,
         )
-    await update.message.reply_text(
-        "\n".join(lines) + "\n\nلتجديد إعلان: /renew رقم_الإعلان\n"
-        "لعرض تقرير إعلان محدد: /stats رقم_الإعلان"
+    else:
+        rows, has_previous, has_next = [], False, False
+
+    if not rows:
+        messages = {
+            "list": "لا توجد إعلانات مرتبطة بحسابك حاليًا.",
+            "stats": "لا توجد إعلانات لعرض إحصاءاتها.",
+            "renew": "لا توجد إعلانات قابلة للتجديد. إذا انتهت صلاحية صورة الإعلان، أنشئ إعلانًا جديدًا بصورة حديثة.",
+            "sold": "لا توجد إعلانات نشطة لتسجيل بيعها.",
+        }
+        text = messages[mode]
+        if cursor_id is not None:
+            text = "لم تعد هناك إعلانات في هذه الصفحة؛ ربما تغيرت حالتها أثناء التنقل. ارجع إلى بداية القائمة."
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("↩️ بداية القائمة", callback_data="mylistings")],
+            [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main_menu")],
+        ])
+    else:
+        lines = [
+            {"list": "📋 إعلاناتك:", "stats": "📊 إحصاءات إعلاناتك:",
+             "renew": "اختر الإعلان الذي تريد تجديده:", "sold": "اختر الإعلان الذي تم بيعه:"}[mode]
+        ]
+        keyboard = []
+        for row in rows:
+            if mode == "stats":
+                lines.append(
+                    f"\n#{row['id']} — {row['title']} — {_status_ar(row['status'])}\n"
+                    f"المشاهدات: {row['views']} | مشاهدون فريدون: {row['unique_viewers']}\n"
+                    f"مرات التواصل: {row['contacts']} | متواصلون فريدون: {row['unique_contacts']}"
+                )
+            elif mode == "list":
+                lines.append(
+                    f"\n#{row['id']} — {row['title']} — {_status_ar(row['status'])}\n"
+                    f"المشاهدات: {row['views']} | تواصل: {row['contacts']}"
+                )
+            else:
+                lines.append(f"\n#{row['id']} — {row['title']} — {_status_ar(row['status'])}")
+            if mode == "list":
+                keyboard.extend(_listing_actions_markup(row).inline_keyboard[:-1])
+            elif mode == "renew":
+                keyboard.append([InlineKeyboardButton("🔄 تجديد الإعلان", callback_data=f"mylisting_renew_{row['id']}")])
+            elif mode == "sold":
+                keyboard.append([InlineKeyboardButton("✅ تم البيع", callback_data=f"mylisting_sold_{row['id']}")])
+            elif mode == "stats":
+                keyboard.append([InlineKeyboardButton("📊 الإحصاءات", callback_data=f"mylisting_stats_{row['id']}")])
+        page_buttons = []
+        if has_previous:
+            page_buttons.append(InlineKeyboardButton(
+                "⬅️ السابقة", callback_data=f"mylistings_page_{mode}_prev_{rows[0]['id']}"
+            ))
+        if has_next:
+            page_buttons.append(InlineKeyboardButton(
+                "التالية ➡️", callback_data=f"mylistings_page_{mode}_next_{rows[-1]['id']}"
+            ))
+        if page_buttons:
+            keyboard.append(page_buttons)
+        if mode == "list":
+            keyboard.append([
+                InlineKeyboardButton("↩️ رجوع", callback_data="main_menu"),
+                InlineKeyboardButton("🛒 سوق الأفراد", callback_data="customer_market"),
+            ])
+        else:
+            keyboard.append([
+                InlineKeyboardButton("↩️ رجوع", callback_data="mylistings"),
+                InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main_menu"),
+            ])
+        text = "\n".join(lines)[:3900]
+        markup = InlineKeyboardMarkup(keyboard)
+
+    query = getattr(update, "callback_query", None)
+    context.user_data["navigation_section"] = "listings"
+    context.user_data["navigation_parent"] = "main"
+    if query:
+        await query.edit_message_text(text, reply_markup=markup)
+    else:
+        await update.message.reply_text(text, reply_markup=markup)
+
+
+async def my_listings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await _safe_answer(query)
+    return await _show_user_listings(update, context)
+
+
+async def my_listings_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await _safe_answer(query)
+    try:
+        _, _, mode, direction, cursor_text = query.data.split("_")
+        cursor_id = int(cursor_text)
+        if mode not in {"list", "stats", "renew", "sold"} or direction not in {"next", "prev"} or cursor_id <= 0:
+            raise ValueError
+    except (ValueError, TypeError):
+        await query.edit_message_text("انتهت صلاحية رابط الصفحة؛ افتح قائمة إعلاناتك من جديد.")
+        return SELECT_ROLE
+    await _show_user_listings(update, context, mode=mode, cursor_id=cursor_id, direction=direction)
+    return SELECT_ROLE
+
+
+async def my_listing_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await _safe_answer(query)
+    try:
+        _, action, listing_id_text = query.data.split("_")
+        listing_id = int(listing_id_text)
+    except (ValueError, IndexError):
+        await query.edit_message_text("تعذر قراءة الإعلان.")
+        return
+    user_id = await _ensure_db_user(update, context)
+    listing = await db.get_listing(listing_id) if user_id else None
+    if not listing or listing["user_id"] != user_id:
+        await query.edit_message_text("هذا الإعلان غير موجود أو لا يخص حسابك.")
+        return
+
+    if action == "stats":
+        stats = await db.listing_report(listing_id)
+        await query.edit_message_text(
+            f"📊 إحصاءات الإعلان #{listing_id}\n{listing['title']}\n\n"
+            f"المشاهدات: {stats['views']}\nالمشاهدون الفريدون: {stats['unique_viewers']}\n"
+            f"مرات التواصل: {stats['contacts']}\nالمتواصلون الفريدون: {stats['unique_contacts']}\n"
+            f"الحالة: {_status_ar(listing['status'])}\nينتهي في: {listing['expires_at']}",
+            reply_markup=_listing_actions_markup(listing),
+        )
+        return
+    if action == "renew":
+        result = await db.renew_listing(listing_id, user_id)
+        text = (
+            f"✅ أُعيد تقديم الإعلان #{listing_id} للمراجعة؛ وتبدأ مدة عرضه 72 ساعة بعد الموافقة."
+            if result else "لا يمكن تجديد هذا الإعلان الآن؛ ربما جُدد سابقًا أو لم يعد صالحًا."
+        )
+    elif action == "sold":
+        result = await db.mark_listing_sold(listing_id, user_id)
+        text = (
+            f"✅ سُجّل بيع الإعلان #{listing_id} وأُوقف عن الظهور."
+            if result else "لا يمكن إيقاف هذا الإعلان؛ ربما سُجّل بيعه مسبقًا."
+        )
+    else:
+        await query.edit_message_text("هذا الإجراء غير معروف.")
+        return
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("📋 إعلاناتي", callback_data="mylistings"),
+            InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main_menu"),
+        ]]),
     )
 
 
+async def cmd_my_listings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _show_user_listings(update, context)
+
+
 async def cmd_listing_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) != 1 or not context.args[0].isdigit():
-        await update.message.reply_text("الاستخدام: /stats رقم_الإعلان")
+    args = getattr(context, "args", None) or []
+    if not args:
+        return await _show_user_listings(update, context, mode="stats")
+    if len(args) != 1 or not args[0].isdigit():
+        await update.message.reply_text("أدخل رقم إعلان صحيحًا، أو استخدم زر «📊 إحصاءات الإعلانات» لعرض إحصاءات إعلاناتك.")
         return
-    user = await db.get_user_by_telegram_id(update.effective_user.id)
-    listing = await db.get_listing(int(context.args[0])) if user else None
-    if not listing or listing["user_id"] != user["id"]:
+    user_id = await _ensure_db_user(update, context)
+    listing = await db.get_listing(int(args[0])) if user_id else None
+    if not listing or listing["user_id"] != user_id:
         await update.message.reply_text("هذا الإعلان غير موجود أو لا يخص حسابك.")
         return
     stats = await db.listing_report(listing["id"])
@@ -1263,27 +1925,31 @@ async def cmd_listing_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"المشاهدون الفريدون: {stats['unique_viewers']}\n"
         f"مرات التواصل: {stats['contacts']}\n"
         f"المتواصلون الفريدون: {stats['unique_contacts']}\n"
-        f"الحالة: {listing['status']}\n"
-        f"ينتهي في: {listing['expires_at']}"
+        f"الحالة: {_status_ar(listing['status'])}\n"
+        f"ينتهي في: {listing['expires_at']}",
+        reply_markup=_listing_actions_markup(listing),
     )
 
 
 async def cmd_renew_listing(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) != 1 or not context.args[0].isdigit():
-        await update.message.reply_text("الاستخدام: /renew رقم_الإعلان")
+    args = getattr(context, "args", None) or []
+    if not args:
+        return await _show_user_listings(update, context, mode="renew")
+    if len(args) != 1 or not args[0].isdigit():
+        await update.message.reply_text("اختر إعلانًا قابلًا للتجديد من القائمة، أو أدخل رقم إعلان صحيحًا.")
         return
-    user = await db.get_user_by_telegram_id(update.effective_user.id)
-    listing_id = int(context.args[0])
-    listing = await db.renew_listing(listing_id, user["id"]) if user else None
+    user_id = await _ensure_db_user(update, context)
+    listing_id = int(args[0])
+    listing = await db.renew_listing(listing_id, user_id) if user_id else None
     if listing:
         await update.message.reply_text(
-            f"✅ تم تجديد الإعلان #{listing['id']} لمدة 72 ساعة وأصبح قيد مراجعة الإدارة مجددًا."
+            f"✅ أُعيد تقديم الإعلان #{listing['id']} للمراجعة؛ وتبدأ مدة عرضه 72 ساعة بعد الموافقة."
         )
     else:
-        previous = await db.get_listing(listing_id) if user else None
+        previous = await db.get_listing(listing_id) if user_id else None
         if (
             previous
-            and previous["user_id"] == user["id"]
+            and previous["user_id"] == user_id
             and previous["status"] == "expired"
             and not (previous["image_file_ids"] or [])
         ):
@@ -1295,19 +1961,54 @@ async def cmd_renew_listing(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_sold_listing(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) != 1 or not context.args[0].isdigit():
-        await update.message.reply_text("الاستخدام: /sold رقم_الإعلان")
+    args = getattr(context, "args", None) or []
+    if not args:
+        return await _show_user_listings(update, context, mode="sold")
+    if len(args) != 1 or not args[0].isdigit():
+        await update.message.reply_text("اختر إعلانًا من قائمتك أو أدخل رقم إعلان صحيحًا.")
         return
-    user = await db.get_user_by_telegram_id(update.effective_user.id)
-    listing = await db.mark_listing_sold(int(context.args[0]), user["id"]) if user else None
+    user_id = await _ensure_db_user(update, context)
+    listing = await db.mark_listing_sold(int(args[0]), user_id) if user_id else None
     await update.message.reply_text(
         "✅ تم إيقاف الإعلان لأنه تم البيع." if listing else "لا يمكن إيقاف هذا الإعلان أو أنه لا يخص حسابك."
     )
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("تم الإلغاء. أرسل /start للبدء من جديد.")
-    return ConversationHandler.END
+    # Clear only the active section's unsaved inputs; saved ads and unrelated drafts survive.
+    market_keys = (
+        "market_draft", "market_preview_id", "market_preview_message", "market_city_id",
+        "edit_listing_city_id", "resubmitting_listing_id", "resubmitting_listing_title",
+        "market_search_id", "market_results", "market_offset", "market_search_city_id",
+        "market_search_city_name", "market_search_action_message",
+    )
+    campaign_keys = ("pending_campaign", "campaign_preview_id", "campaign_preview_message")
+    merchant_form_keys = ("biz_name", "biz_type", "biz_city_id", "selected_categories", "awaiting_redeem_code")
+    customer_keys = ("customer_city_id", "selected_categories")
+    section = context.user_data.get("navigation_section")
+    if section == "marketplace":
+        keys_to_clear = market_keys
+    elif section == "merchant":
+        keys_to_clear = campaign_keys + merchant_form_keys
+    elif section == "customer":
+        keys_to_clear = customer_keys
+    elif context.user_data.get("pending_campaign") and not context.user_data.get("market_draft"):
+        keys_to_clear = campaign_keys
+    elif context.user_data.get("market_draft") and not context.user_data.get("pending_campaign"):
+        keys_to_clear = market_keys
+    elif context.user_data.get("awaiting_redeem_code"):
+        keys_to_clear = ("awaiting_redeem_code",)
+    else:
+        keys_to_clear = ()
+    for key in keys_to_clear:
+        context.user_data.pop(key, None)
+    context.user_data["navigation_section"] = "main"
+    context.user_data.pop("navigation_parent", None)
+    await update.message.reply_text(
+        "أُلغيت الخطوة غير المرسلة في القسم الحالي فقط؛ لم يتغير أي إعلان محفوظ، وبقيت المسودات الأخرى كما هي. اختر إجراءً آخر:",
+        reply_markup=_user_reply_keyboard(context),
+    )
+    return SELECT_ROLE
 
 
 # =================================================================
@@ -1331,26 +2032,87 @@ async def post_shutdown(application: Application):
     await db.close_pool()
 
 
+def _select_role_handler(handler):
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await handler(update, context)
+        return SELECT_ROLE
+
+    return wrapped
+
+
 def build_application() -> Application:
     token = os.environ["TELEGRAM_BOT_TOKEN"]
-    application = Application.builder().token(token).post_init(post_init).post_shutdown(post_shutdown).build()
-
-    # هذه المعالجات تسبق المحادثة حتى يعمل زر التحقق بعد إعادة تشغيل البوت أيضًا.
-    application.add_handler(MessageHandler(
-        filters.Regex(r"^🎟️ تحقق من كود خصم$"), merchant_redeem_keyboard_entry
-    ), group=0)
-    application.add_handler(CallbackQueryHandler(
-        merchant_redeem_prompt_fallback, pattern=r"^redeem_menu$"
-    ), group=0)
-    application.add_handler(MessageHandler(
-        filters.Regex(r"^[A-Za-z]{2,10}-[A-Za-z0-9]{4,12}$"), merchant_redeem_fallback_message
-    ), group=0)
+    application = (
+        Application.builder()
+        .token(token)
+        .connection_pool_size(32)
+        .pool_timeout(10)
+        .connect_timeout(10)
+        .read_timeout(15)
+        .write_timeout(15)
+        .get_updates_connection_pool_size(2)
+        .get_updates_pool_timeout(10)
+        .get_updates_connect_timeout(10)
+        .get_updates_read_timeout(30)
+        .get_updates_write_timeout(10)
+        .concurrent_updates(False)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
     conv = ConversationHandler(
+        # Shared chat-level state is intentional for the mixed text/callback flows.
+        per_message=False,
         entry_points=[
             CommandHandler("start", start),
+            CommandHandler("cancel", cancel),
             CommandHandler("editlisting", marketplace.edit_listing_start),
             CallbackQueryHandler(marketplace.market_menu, pattern="^customer_market$"),
+            CallbackQueryHandler(marketplace.resume_listing_flow, pattern="^resume_listing_flow$"),
+            CallbackQueryHandler(
+                marketplace.sell_confirm,
+                pattern=r"^(?:market|listing)_[0-9a-f]{12}_(?:submit|resend|cancel)$",
+            ),
+            CallbackQueryHandler(marketplace.edit_listing_start, pattern=r"^mylisting_edit_\d+$"),
+            CallbackQueryHandler(main_menu_callback, pattern="^main_menu$"),
+            CallbackQueryHandler(merchant_menu_callback, pattern="^merchant_menu$"),
+            CallbackQueryHandler(resume_campaign_preview, pattern="^resume_campaign$"),
+            CallbackQueryHandler(_select_role_handler(admin_pending_callback), pattern="^admin_pending$"),
+            CallbackQueryHandler(_select_role_handler(admin_pending_businesses_callback), pattern="^admin_businesses$"),
+            CallbackQueryHandler(_select_role_handler(admin_listings_callback), pattern="^admin_listings$"),
+            CallbackQueryHandler(_select_role_handler(admin_reports_callback), pattern="^admin_reports$"),
+            CallbackQueryHandler(_select_role_handler(admin_business_action), pattern=r"^admin_business_(approve|reject)_\d+$"),
+            CallbackQueryHandler(_select_role_handler(admin_campaign_action), pattern=r"^admin_(approve|reject)_\d+$"),
+            CallbackQueryHandler(_select_role_handler(admin_listing_action), pattern=r"^listing_(approve|reject)_\d+$"),
+            CallbackQueryHandler(_select_role_handler(admin_send_callback), pattern=r"^admin_send_\d+$"),
+            CallbackQueryHandler(_select_role_handler(get_discount_code), pattern=r"^getcode_\d+$"),
+            CallbackQueryHandler(_select_role_handler(customer_directory_callback), pattern="^customer_directory$"),
+            CallbackQueryHandler(_select_role_handler(listing_contact_callback), pattern=r"^listing_contact_\d+$"),
+            CallbackQueryHandler(_select_role_handler(business_contact_callback), pattern=r"^business_contact_\d+$"),
+            CallbackQueryHandler(_select_role_handler(my_listings_callback), pattern="^mylistings$"),
+            CallbackQueryHandler(
+                _select_role_handler(my_listings_page_callback),
+                pattern=r"^mylistings_page_(list|stats|renew|sold)_(next|prev)_\d+$",
+            ),
+            CallbackQueryHandler(_select_role_handler(my_listing_action_callback), pattern=r"^mylisting_(stats|renew|sold)_\d+$"),
+            CommandHandler("pending", _select_role_handler(cmd_pending)),
+            CommandHandler("report", _select_role_handler(cmd_report)),
+            CommandHandler("resume", _select_role_handler(cmd_resume_campaign)),
+            CommandHandler("redeem", _select_role_handler(cmd_redeem)),
+            CommandHandler("mylistings", _select_role_handler(cmd_my_listings)),
+            CommandHandler("stats", _select_role_handler(cmd_listing_stats)),
+            CommandHandler("renew", _select_role_handler(cmd_renew_listing)),
+            CommandHandler("sold", _select_role_handler(cmd_sold_listing)),
+            MessageHandler(filters.Regex(r"^/approve_\d+$") | filters.Regex(r"^/reject_\d+$"), _select_role_handler(cmd_approve_reject)),
+            MessageHandler(filters.Regex(r"^/send_\d+$"), _select_role_handler(cmd_send_campaign)),
+            CallbackQueryHandler(
+                role_router,
+                pattern=r"^(role_customer|role_merchant|how_it_works|contact_us|admin_menu)$",
+            ),
+            CallbackQueryHandler(customer_city_back, pattern="^customer_city_back$"),
+            CallbackQueryHandler(merchant_redeem_prompt_fallback, pattern="^redeem_menu$"),
+            MessageHandler(_root_keyboard_filter(), text_role_router),
         ],
         states={
             SELECT_ROLE: [
@@ -1362,8 +2124,6 @@ def build_application() -> Application:
                 CallbackQueryHandler(admin_campaign_action, pattern=r"^admin_(approve|reject)_\d+$"),
                 CallbackQueryHandler(admin_listing_action, pattern=r"^listing_(approve|reject)_\d+$"),
                 CallbackQueryHandler(admin_send_callback, pattern=r"^admin_send_\d+$"),
-            CallbackQueryHandler(marketplace.market_menu, pattern="^customer_market$"),
-                CallbackQueryHandler(role_router),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, text_role_router),
             ],
             CUST_CITY: [CallbackQueryHandler(customer_city_chosen, pattern="^city_")],
@@ -1373,7 +2133,10 @@ def build_application() -> Application:
             MER_BIZ_CITY: [CallbackQueryHandler(merchant_biz_city, pattern="^bizcity_")],
             MER_BIZ_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, merchant_biz_phone)],
             MER_MENU: [
-                CallbackQueryHandler(merchant_menu_router, pattern=r"^(new_campaign|redeem_menu|my_campaigns|business_status)$"),
+                CallbackQueryHandler(
+                    merchant_menu_router,
+                    pattern=r"^(?:new_campaign|new_campaign_discard_[0-9a-f]{12}|redeem_menu|my_campaigns|business_status)$",
+                ),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, merchant_text_menu_router),
             ],
             REDEEM_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, merchant_redeem_code_received)],
@@ -1389,34 +2152,8 @@ def build_application() -> Application:
     )
     application.add_handler(conv)
 
-    # أوامر الإدارة (خارج المحادثة الرئيسية)
-    application.add_handler(CommandHandler("pending", cmd_pending))
-    application.add_handler(CommandHandler("report", cmd_report))
-    application.add_handler(CommandHandler("redeem", cmd_redeem))
-    application.add_handler(CommandHandler("mylistings", cmd_my_listings))
-    application.add_handler(CommandHandler("stats", cmd_listing_stats))
-    application.add_handler(CommandHandler("renew", cmd_renew_listing))
-    application.add_handler(CommandHandler("sold", cmd_sold_listing))
-    application.add_handler(
-        MessageHandler(filters.Regex(r"^/approve_\d+$") | filters.Regex(r"^/reject_\d+$"), cmd_approve_reject)
-    )
-    application.add_handler(MessageHandler(filters.Regex(r"^/send_\d+$"), cmd_send_campaign))
-
-    # استلام كود الخصم من رسالة الحملة المُرسلة للعميل
-    application.add_handler(CallbackQueryHandler(admin_pending_callback, pattern="^admin_pending$"))
-    application.add_handler(CallbackQueryHandler(admin_pending_businesses_callback, pattern="^admin_businesses$"))
-    application.add_handler(CallbackQueryHandler(admin_listings_callback, pattern="^admin_listings$"))
-    application.add_handler(CallbackQueryHandler(admin_reports_callback, pattern="^admin_reports$"))
-    application.add_handler(CallbackQueryHandler(admin_business_action, pattern=r"^admin_business_(approve|reject)_\d+$"))
-    application.add_handler(CallbackQueryHandler(admin_campaign_action, pattern=r"^admin_(approve|reject)_\d+$"))
-    application.add_handler(CallbackQueryHandler(admin_listing_action, pattern=r"^listing_(approve|reject)_\d+$"))
-    application.add_handler(CallbackQueryHandler(admin_send_callback, pattern=r"^admin_send_\d+$"))
-    application.add_handler(CallbackQueryHandler(get_discount_code, pattern="^getcode_"))
-    application.add_handler(CallbackQueryHandler(merchant_redeem_prompt_fallback, pattern="^redeem_menu$"))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, merchant_redeem_fallback_message))
-    application.add_handler(CallbackQueryHandler(customer_directory_callback, pattern="^customer_directory$"))
-    application.add_handler(CallbackQueryHandler(listing_contact_callback, pattern=r"^listing_contact_\d+$"))
-    application.add_handler(CallbackQueryHandler(business_contact_callback, pattern=r"^business_contact_\d+$"))
+    # Every user/admin action is routed through the ConversationHandler so a
+    # one-shot callback cannot leave a stale interactive state behind.
     application.add_error_handler(on_error)
 
     return application
@@ -1425,7 +2162,7 @@ def build_application() -> Application:
 def main():
     app = build_application()
     log.info("البوت يعمل الآن (polling)...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":
