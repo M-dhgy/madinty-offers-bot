@@ -417,7 +417,8 @@ async def create_campaign(business_id: int, raw_input: str, ai_data: dict, ad_te
         """INSERT INTO campaigns
              (business_id, title, description, raw_input, category_id, city_id,
               target_audience, discount_percent, start_date, end_date, status)
-           SELECT b.id, $2, $3, $4, ca.id, ci.id, $7, $8, $9::date, $10::date, 'pending_review'
+           SELECT b.id, $2, $3, $4, ca.id, ci.id, $7, $8,
+                  NULLIF($9::text, '')::date, NULLIF($10::text, '')::date, 'pending_review'
            FROM businesses b
            JOIN cities ci ON ci.id=$6 AND ci.status='active'
            JOIN categories ca ON ca.id=$5 AND ca.status='active'
