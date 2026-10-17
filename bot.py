@@ -1150,17 +1150,17 @@ async def listing_contact_callback(update: Update, context: ContextTypes.DEFAULT
 
 async def business_contact_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     try:
         business_id = int(query.data.rsplit("_", 1)[1])
     except (ValueError, IndexError):
-        await query.edit_message_text("تعذر قراءة النشاط.")
+        await query.answer("تعذر قراءة النشاط.", show_alert=True)
         return
     business = await db.get_business(business_id)
-    buyer = await db.get_user_by_telegram_id(update.effective_user.id)
     if not business or business["status"] != "approved":
         await query.answer("النشاط غير متاح حاليًا.", show_alert=True)
         return
+    await query.answer()
+    buyer = await db.get_user_by_telegram_id(update.effective_user.id)
     await db.log_business_event(business_id, buyer["id"] if buyer else None, "CONTACT")
     await query.message.reply_text(
         f"للتواصل مع {business['business_name']}: {business['phone'] or 'لا يوجد رقم مسجل'}"
