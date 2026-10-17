@@ -84,10 +84,13 @@ async def sell_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return SELL_MESSAGE
 
     reviewed = await ai.review_listing(parsed)
-    if reviewed.get("ai_unavailable") or reviewed.get("issues") or not isinstance(reviewed.get("issues"), list):
+    review_issues = reviewed.get("issues") if isinstance(reviewed, dict) else None
+    if reviewed.get("ai_unavailable") or review_issues or not isinstance(review_issues, list):
+        if not review_issues:
+            review_issues = ["تعذر التحقق من الإعلان حاليًا. حاول مرة أخرى لاحقًا."]
         await message.reply_text(
             "⚠️ يحتاج الإعلان إلى توضيح:\n- "
-            + "\n- ".join(map(str, reviewed["issues"]))
+            + "\n- ".join(map(str, review_issues))
             + "\n\nأرسل الصورة مع التفاصيل المصححة."
         )
         return SELL_MESSAGE
