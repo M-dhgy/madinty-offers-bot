@@ -613,6 +613,7 @@ async def redeem_code_for_business(code: str, business_id: int):
                 """UPDATE discount_codes dc SET status='redeemed', redeemed_at=now()
                    FROM campaigns c
                    WHERE dc.campaign_id=c.id AND c.business_id=$1
+                     AND EXISTS (SELECT 1 FROM businesses b WHERE b.id=$1 AND b.status='approved')
                      AND dc.code=$2 AND dc.status='unused'
                      AND (dc.expires_at IS NULL OR dc.expires_at >= CURRENT_DATE)
                    RETURNING dc.*""",
