@@ -42,7 +42,7 @@ async def sell_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• العنوان ومكان وجود الغرض أو البائع\n"
         "• رقم التواصل\n"
         "• هل توجد خدمة توصيل؟\n\n"
-        "مسموح بصورة أو صورتين، ولن يُرسل الإعلان للإدارة قبل اكتمال البيانات.\n\n"
+        "أرسل صورة واحدة واضحة، ولن يُرسل الإعلان للإدارة قبل اكتمال البيانات.\n\n"
         "مثال على شرح الصورة:\n"
         "هاتف Samsung A54 مستعمل بحالة ممتازة. السعر 800000 جنيه، "
         "قابل للتفاوض. الموقع: بحري السوق العربي. التواصل: 09xxxxxxxx. "
@@ -62,12 +62,18 @@ async def sell_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     missing = []
     required = {
         "اسم الغرض": parsed.get("title"),
+        "وصف الغرض": parsed.get("description"),
+        "السعر المحدد": parsed.get("price"),
         "العنوان والموقع": parsed.get("address"),
         "رقم التواصل": parsed.get("contact"),
     }
     for label, value in required.items():
-        if value is None or value == "" or value == []:
+        if value is None or not str(value).strip():
             missing.append(label)
+    price_text = str(parsed.get("price") or "").strip().lower()
+    if price_text in {"عند التواصل", "حسب الاتفاق", "غير محدد", "غير مذكور", "n/a", "na"}:
+        if "السعر المحدد" not in missing:
+            missing.append("السعر المحدد")
     missing.extend(str(x) for x in (parsed.get("issues") or []))
     if missing:
         await message.reply_text(
@@ -78,7 +84,7 @@ async def sell_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return SELL_MESSAGE
 
     reviewed = await ai.review_listing(parsed)
-    if reviewed.get("issues"):
+    if reviewed.get("ai_unavailable") or reviewed.get("issues") or not isinstance(reviewed.get("issues"), list):
         await message.reply_text(
             "⚠️ يحتاج الإعلان إلى توضيح:\n- "
             + "\n- ".join(map(str, reviewed["issues"]))
@@ -88,8 +94,8 @@ async def sell_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["market_draft"] = {
         "title": reviewed.get("title") or parsed["title"],
-        "description": reviewed.get("description") or parsed.get("description") or "غير مذكور",
-        "price": str(parsed.get("price") or "عند التواصل"),
+        "description": reviewed.get("description") or parsed["description"],
+        "price": str(parsed["price"]),
         "negotiable": bool(parsed.get("negotiable", False)),
         "address": parsed["address"],
         "contact": parsed["contact"],
@@ -130,9 +136,13 @@ async def sell_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not draft:
         await query.edit_message_text("انتهت جلسة الإعلان. ابدأ من سوق الأفراد مرة أخرى.")
         return ConversationHandler.END
+    user = await db.get_user_by_id(_user_id(context))
+    if not user or not user.get("city_id"):
+        await query.edit_message_text("⚠️ حدّد مدينتك أولًا من القائمة الرئيسية قبل نشر إعلان.")
+        return ConversationHandler.END
     listing = await db.create_listing(
         _user_id(context), draft["title"], draft["description"], draft["price"],
-        draft["condition"], None, draft["category"], draft["address"],
+        draft["condition"], user["city_id"], draft["category"], draft["address"],
         draft["contact"], draft["delivery"], draft["negotiable"], draft["photo_ids"],
     )
     context.user_data.pop("market_draft", None)
@@ -159,23 +169,66 @@ async def buy_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(text) < 2:
         await update.message.reply_text("اكتب كلمة أو جملة أوضح لما تبحث عنه.")
         return BUY_QUERY
-    listings = await db.list_public_listings()
+    user = await db.get_user_by_id(_user_id(context))
+    city_id = user["city_id"] if user else None
+    listings = await db.list_public_listings(city_id=city_id)
     ranked = await ai.rank_listing_ids(text, listings)
     lookup = {row["id"]: row for row in listings}
     ids = [x for x in ranked if x in lookup]
+    context.user_data["market_query"] = text
+    context.user_data["market_city_id"] = city_id
+    context.user_data["market_all_cities"] = False
+    if not ids:
+        buttons = [[InlineKeyboardButton("🌍 البحث في كل المدن", callback_data="market_all_cities")],
+                   [InlineKeyboardButton("🔎 بحث جديد", callback_data="market_new_search")]]
+        await update.message.reply_text(
+            "لم نجد إعلانًا مطابقًا في مدينتك.",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return MARKET_MENU
     matches = [lookup[x] for x in ids[:5]]
-    if not matches:
-        await update.message.reply_text("لم نجد إعلانًا مطابقًا حاليًا.")
-        return ConversationHandler.END
     context.user_data["market_results"] = ids
     context.user_data["market_offset"] = 5
-    await update.message.reply_text(f"✅ أفضل {len(matches)} إعلانات مطابقة:")
+    await update.message.reply_text(f"✅ أفضل {len(matches)} إعلانات مطابقة في مدينتك:")
+    await _send_results(update, context, matches)
+    buttons = []
+    if len(ids) > 5:
+        buttons.append([InlineKeyboardButton("📄 المزيد من الإعلانات", callback_data="market_more")])
+    if city_id:
+        buttons.append([InlineKeyboardButton("🌍 البحث في كل المدن", callback_data="market_all_cities")])
+    buttons.append([InlineKeyboardButton("🔎 بحث جديد", callback_data="market_new_search")])
+    await update.message.reply_text("اختر إجراءً:", reply_markup=InlineKeyboardMarkup(buttons))
+    return MARKET_MENU
+
+
+async def search_all_cities(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    search_text = (context.user_data.get("market_query") or "").strip()
+    if not search_text:
+        await query.edit_message_text("ابدأ بحثًا جديدًا من سوق الأفراد.")
+        return MARKET_MENU
+    listings = await db.list_public_listings()
+    ranked = await ai.rank_listing_ids(search_text, listings)
+    lookup = {row["id"]: row for row in listings}
+    ids = [x for x in ranked if x in lookup]
+    context.user_data["market_results"] = ids
+    context.user_data["market_offset"] = 5
+    context.user_data["market_all_cities"] = True
+    if not ids:
+        await query.edit_message_text("لم نجد إعلانًا مطابقًا في أي مدينة.")
+        return MARKET_MENU
+    matches = [lookup[x] for x in ids[:5]]
+    await query.edit_message_text(f"🌍 أفضل {len(matches)} إعلانات مطابقة من كل المدن:")
     await _send_results(update, context, matches)
     buttons = []
     if len(ids) > 5:
         buttons.append([InlineKeyboardButton("📄 المزيد من الإعلانات", callback_data="market_more")])
     buttons.append([InlineKeyboardButton("🔎 بحث جديد", callback_data="market_new_search")])
-    await update.message.reply_text("اختر إجراءً:", reply_markup=InlineKeyboardMarkup(buttons))
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id, text="اختر إجراءً:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
     return MARKET_MENU
 
 
@@ -184,7 +237,9 @@ async def more_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     ids = context.user_data.get("market_results", [])
     offset = context.user_data.get("market_offset", 5)
-    rows = await db.list_public_listings()
+    user = await db.get_user_by_id(_user_id(context))
+    city_id = None if context.user_data.get("market_all_cities") else (user["city_id"] if user else None)
+    rows = await db.list_public_listings(city_id=city_id)
     lookup = {row["id"]: row for row in rows}
     matches = [lookup[x] for x in ids[offset:offset + 5] if x in lookup]
     if not matches:
@@ -229,6 +284,7 @@ def states():
             CallbackQueryHandler(buy_start, pattern="^market_buy$"),
             CallbackQueryHandler(sell_start, pattern="^market_sell$"),
             CallbackQueryHandler(more_results, pattern="^market_more$"),
+            CallbackQueryHandler(search_all_cities, pattern="^market_all_cities$"),
             CallbackQueryHandler(new_search, pattern="^market_new_search$"),
         ],
         SELL_MESSAGE: [
