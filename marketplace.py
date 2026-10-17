@@ -85,7 +85,7 @@ async def sell_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     reviewed = await ai.review_listing(parsed)
     review_issues = reviewed.get("issues") if isinstance(reviewed, dict) else None
-    if reviewed.get("ai_unavailable") or review_issues or not isinstance(review_issues, list):
+    if not isinstance(reviewed, dict) or reviewed.get("ai_unavailable") or review_issues or not isinstance(review_issues, list):
         if not review_issues:
             review_issues = ["تعذر التحقق من الإعلان حاليًا. حاول مرة أخرى لاحقًا."]
         await message.reply_text(
