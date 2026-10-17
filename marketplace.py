@@ -171,7 +171,7 @@ async def buy_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return BUY_QUERY
     user = await db.get_user_by_id(_user_id(context))
     city_id = user["city_id"] if user else None
-    listings = await db.list_public_listings(city_id=city_id)
+    listings = await db.list_public_listings(city_id=city_id if city_id else -1)
     ranked = await ai.rank_listing_ids(text, listings)
     lookup = {row["id"]: row for row in listings}
     ids = [x for x in ranked if x in lookup]
@@ -239,6 +239,8 @@ async def more_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
     offset = context.user_data.get("market_offset", 5)
     user = await db.get_user_by_id(_user_id(context))
     city_id = None if context.user_data.get("market_all_cities") else (user["city_id"] if user else None)
+    if city_id is None and not context.user_data.get("market_all_cities"):
+        city_id = -1
     rows = await db.list_public_listings(city_id=city_id)
     lookup = {row["id"]: row for row in rows}
     matches = [lookup[x] for x in ids[offset:offset + 5] if x in lookup]
