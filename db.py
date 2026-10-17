@@ -8,6 +8,7 @@ v0.2:
   • أنشطة pending لا تظهر للعملاء إلا بعد الاعتماد
 """
 
+import hashlib
 import os
 import random
 import string
@@ -31,7 +32,6 @@ async def init_pool():
         CREATE INDEX IF NOT EXISTS idx_businesses_city   ON businesses(city_id);
         CREATE INDEX IF NOT EXISTS idx_campaigns_city_cat ON campaigns(city_id, category_id);
         CREATE INDEX IF NOT EXISTS idx_codes_campaign    ON discount_codes(campaign_id, status);
-        CREATE INDEX IF NOT EXISTS idx_listings_user     ON listings(user_id);
 
         CREATE TABLE IF NOT EXISTS listings (
             id SERIAL PRIMARY KEY,
@@ -52,6 +52,7 @@ async def init_pool():
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
+        CREATE INDEX IF NOT EXISTS idx_listings_user ON listings(user_id);
         CREATE TABLE IF NOT EXISTS listing_events (
             id SERIAL PRIMARY KEY,
             listing_id INTEGER NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
@@ -117,6 +118,28 @@ async def find_city_by_name(text: str):
            WHERE status='active' AND (name ILIKE $1 OR code ILIKE $1)
            ORDER BY id LIMIT 1""",
         f"%{text}%",
+    )
+
+
+async def find_or_create_city(text: str):
+    """Return an exact active city match, or create a named custom city."""
+    name = " ".join((text or "").split())
+    if not name or len(name) > 100:
+        return None
+    existing = await pool().fetchrow(
+        """SELECT id, name, code FROM cities
+           WHERE status='active' AND lower(trim(name))=lower(trim($1))
+           ORDER BY id LIMIT 1""",
+        name,
+    )
+    if existing:
+        return existing
+    code = "CUSTOM_" + hashlib.sha256(name.casefold().encode("utf-8")).hexdigest()[:16].upper()
+    return await pool().fetchrow(
+        """INSERT INTO cities (name, code, status) VALUES ($1, $2, 'active')
+           ON CONFLICT (code) DO UPDATE SET name=EXCLUDED.name
+           RETURNING id, name, code""",
+        name, code,
     )
 
 
@@ -393,8 +416,8 @@ async def create_campaign(business_id: int, raw_input: str, ai_data: dict, ad_te
     return await pool().fetchrow(
         """INSERT INTO campaigns
              (business_id, title, description, raw_input, category_id, city_id,
-              target_audience, discount_percent, status)
-           SELECT b.id, $2, $3, $4, ca.id, ci.id, $7, $8, 'pending_review'
+              target_audience, discount_percent, start_date, end_date, status)
+           SELECT b.id, $2, $3, $4, ca.id, ci.id, $7, $8, $9::date, $10::date, 'pending_review'
            FROM businesses b
            JOIN cities ci ON ci.id=$6 AND ci.status='active'
            JOIN categories ca ON ca.id=$5 AND ca.status='active'
@@ -408,6 +431,8 @@ async def create_campaign(business_id: int, raw_input: str, ai_data: dict, ad_te
         city_id,
         ai_data.get("target"),
         ai_data.get("discount"),
+        ai_data.get("start") or None,
+        ai_data.get("end") or None,
     )
 
 
@@ -464,6 +489,8 @@ async def claim_campaign_for_broadcast(campaign_id: int):
         """UPDATE campaigns c SET status='sending', broadcast_started_at=now()
            FROM businesses b, cities ci, categories ca
            WHERE c.id=$1 AND c.status='approved'
+             AND (c.start_date IS NULL OR c.start_date <= CURRENT_DATE)
+             AND (c.end_date IS NULL OR c.end_date >= CURRENT_DATE)
              AND b.id=c.business_id AND b.status='approved'
              AND ci.id=c.city_id AND ci.status='active' AND b.city_id=ci.id
              AND ca.id=c.category_id AND ca.status='active'
