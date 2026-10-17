@@ -27,6 +27,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     ConversationHandler,
+    ApplicationHandlerStop,
     MessageHandler,
     filters,
 )
@@ -81,6 +82,8 @@ BATCH_DELAY_SECONDS = _nonnegative_float_env("BROADCAST_BATCH_DELAY", 1.5)
     CAMPAIGN_CONFIRM,
 ) = range(10)
 REDEEM_CODE = 10
+CUST_CITY_OTHER = 11
+MER_BIZ_CITY_OTHER = 12
 
 BIZ_TYPES = ["مطعم / كافيه", "متجر", "مركز تجميل", "خدمات"]
 MERCHANT_LAUNCH_PRICING_NOTICE = (
@@ -111,28 +114,37 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(update):
         keyboard.append([InlineKeyboardButton("🛠 لوحة الإدارة", callback_data="admin_menu")])
     await update.message.reply_text(
-        "أهلاً بك في *عروض مدينتي* 👋\n\nاختر نوع حسابك:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    await update.message.reply_text(
-        "يمكنك أيضًا استخدام القائمة العربية أسفل الشاشة للتنقل بسهولة.",
+        "أهلاً بك في *عروض مدينتي* 👋",
         reply_markup=ReplyKeyboardMarkup(
-            [["🔎 أبحث عن عروض", "🛒 سوق الأفراد"], ["🏪 صاحب نشاط تجاري"], ["ℹ️ كيف يعمل؟", "📞 تواصل معنا"]],
+            [["↩️ رجوع", "🏠 القائمة الرئيسية"]],
             resize_keyboard=True,
             is_persistent=True,
         ),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    await update.message.reply_text(
+        "اختر نوع حسابك:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
     return SELECT_ROLE
+
+
+async def navigation_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أزرار التنقل السفلية تعيد المستخدم إلى القائمة الرئيسية بأمان."""
+    await start(update, context)
+    raise ApplicationHandlerStop
 
 
 async def text_role_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """يعالج اختيارات القائمة النصية بدل إجبار المستخدم على كتابة أوامر."""
     text = (update.message.text or "").strip()
+    if text in {"↩️ رجوع", "🏠 القائمة الرئيسية"}:
+        return await start(update, context)
     if text == "🔎 أبحث عن عروض":
         await db.set_account_type(context.user_data["db_user_id"], "customer")
         cities = await db.list_cities()
         keyboard = [[InlineKeyboardButton(c["name"], callback_data=f"city_{c['id']}")] for c in cities]
+        keyboard.append([InlineKeyboardButton("أخرى", callback_data="city_other")])
         await update.message.reply_text("اختر مدينتك:", reply_markup=InlineKeyboardMarkup(keyboard))
         return CUST_CITY
     if text == "🏪 صاحب نشاط تجاري":
@@ -187,6 +199,7 @@ async def role_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await db.set_account_type(context.user_data["db_user_id"], "customer")
         cities = await db.list_cities()
         keyboard = [[InlineKeyboardButton(c["name"], callback_data=f"city_{c['id']}")] for c in cities]
+        keyboard.append([InlineKeyboardButton("أخرى", callback_data="city_other")])
         await query.edit_message_text("اختر مدينتك:", reply_markup=InlineKeyboardMarkup(keyboard))
         return CUST_CITY
 
@@ -472,6 +485,25 @@ def _broadcast_result_text(campaign_id: int, result: dict) -> str:
 # =================================================================
 # تدفّق المستخدم (العميل)
 # =================================================================
+async def customer_city_other_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("اكتب اسم مدينتك في رسالة واحدة:")
+    return CUST_CITY_OTHER
+
+
+async def customer_city_other_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    city_name = (update.message.text or "").strip()
+    city = await db.find_or_create_city(city_name)
+    if not city:
+        await update.message.reply_text("اسم المدينة غير صالح. اكتب اسمًا أقصر من 100 حرف.")
+        return CUST_CITY_OTHER
+    await db.set_user_city(context.user_data["db_user_id"], city["id"])
+    context.user_data["selected_categories"] = set()
+    await render_category_picker(update.message, context)
+    return CUST_CATEGORIES
+
+
 async def customer_city_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -491,10 +523,16 @@ async def render_category_picker(query, context):
         mark = "✅ " if c["id"] in selected else ""
         keyboard.append([InlineKeyboardButton(f"{mark}{c['name']}", callback_data=f"cat_{c['id']}")])
     keyboard.append([InlineKeyboardButton("✔️ تأكيد الاشتراك", callback_data="cat_confirm")])
-    await query.edit_message_text(
-        "اختر اهتماماتك (يمكن اختيار أكثر من واحد):",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+    if hasattr(query, "edit_message_text"):
+        await query.edit_message_text(
+            "اختر اهتماماتك (يمكن اختيار أكثر من واحد):",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+    else:
+        await query.reply_text(
+            "اختر اهتماماتك (يمكن اختيار أكثر من واحد):",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
 
 
 async def customer_category_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -562,14 +600,34 @@ async def merchant_biz_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["biz_type"] = query.data.split("_", 1)[1]
     cities = await db.list_cities()
     keyboard = [[InlineKeyboardButton(c["name"], callback_data=f"bizcity_{c['id']}")] for c in cities]
+    keyboard.append([InlineKeyboardButton("أخرى", callback_data="bizcity_other")])
     await query.edit_message_text("في أي مدينة يقع النشاط؟", reply_markup=InlineKeyboardMarkup(keyboard))
     return MER_BIZ_CITY
+
+
+async def merchant_biz_city_other_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("اكتب اسم المدينة التي يقع فيها النشاط:")
+    return MER_BIZ_CITY_OTHER
+
+
+async def merchant_biz_city_other_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    city_name = (update.message.text or "").strip()
+    city = await db.find_or_create_city(city_name)
+    if not city:
+        await update.message.reply_text("اسم المدينة غير صالح. اكتب اسمًا أقصر من 100 حرف.")
+        return MER_BIZ_CITY_OTHER
+    context.user_data["biz_city_id"] = city["id"]
+    await update.message.reply_text("ما رقم التواصل (واتساب/هاتف)؟")
+    return MER_BIZ_PHONE
 
 
 async def merchant_biz_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    context.user_data["biz_city_id"] = int(query.data.split("_")[1])
+    city_id = int(query.data.split("_")[1])
+    context.user_data["biz_city_id"] = city_id
     await query.edit_message_text("ما رقم التواصل (واتساب/هاتف)؟")
     return MER_BIZ_PHONE
 
@@ -602,20 +660,23 @@ async def show_merchant_menu(update_or_query, context: ContextTypes.DEFAULT_TYPE
             [InlineKeyboardButton("🎟️ تحقق من كود خصم", callback_data="redeem_menu")],
         ]
         text = f"لوحة التاجر — ماذا تريد أن تفعل؟\n\n{MERCHANT_LAUNCH_PRICING_NOTICE}"
-        reply_rows = [["➕ إنشاء حملة", "📊 حالة حملاتي"], ["🎟️ تحقق من كود خصم"]]
     else:
         keyboard = [[InlineKeyboardButton("🏪 حالة مراجعة النشاط", callback_data="business_status")]]
         text = _business_status_text(business)
-        reply_rows = [["🏪 حالة النشاط"]]
-    reply_keyboard = ReplyKeyboardMarkup(
-        reply_rows + [["🏠 القائمة الرئيسية"]], resize_keyboard=True, is_persistent=True
+
+    nav_keyboard = ReplyKeyboardMarkup(
+        [["↩️ رجوع", "🏠 القائمة الرئيسية"]],
+        resize_keyboard=True,
+        is_persistent=True,
     )
-    if hasattr(update_or_query, "message") and update_or_query.message is None:
+    if hasattr(update_or_query, "edit_message_text"):
         await update_or_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-        await update_or_query.message.reply_text("استخدم القائمة أسفل الشاشة للتعامل مع البوت.", reply_markup=reply_keyboard)
+        target_message = update_or_query.message
     else:
-        target = update_or_query.message if hasattr(update_or_query, "message") else update_or_query
-        await target.reply_text(text, reply_markup=reply_keyboard)
+        target_message = update_or_query.message if hasattr(update_or_query, "message") else update_or_query
+        await target_message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    if target_message:
+        await target_message.reply_text("التنقل:", reply_markup=nav_keyboard)
     return MER_MENU
 
 
@@ -1097,7 +1158,7 @@ async def business_contact_callback(update: Update, context: ContextTypes.DEFAUL
         return
     business = await db.get_business(business_id)
     buyer = await db.get_user_by_telegram_id(update.effective_user.id)
-    if not business:
+    if not business or business["status"] != "approved":
         await query.answer("النشاط غير متاح حاليًا.", show_alert=True)
         return
     await db.log_business_event(business_id, buyer["id"] if buyer else None, "CONTACT")
@@ -1254,11 +1315,25 @@ def build_application() -> Application:
                 CallbackQueryHandler(role_router),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, text_role_router),
             ],
-            CUST_CITY: [CallbackQueryHandler(customer_city_chosen, pattern="^city_")],
+            CUST_CITY: [
+                CallbackQueryHandler(customer_city_other_prompt, pattern="^city_other$"),
+                CallbackQueryHandler(customer_city_chosen, pattern=r"^city_\d+$"),
+            ],
+            CUST_CITY_OTHER: [
+                MessageHandler(filters.Regex(r"^(↩️ رجوع|🏠 القائمة الرئيسية)$"), navigation_text_router),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, customer_city_other_received),
+            ],
             CUST_CATEGORIES: [CallbackQueryHandler(customer_category_toggle, pattern="^cat_")],
             MER_BIZ_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, merchant_biz_name)],
             MER_BIZ_TYPE: [CallbackQueryHandler(merchant_biz_type, pattern="^biztype_")],
-            MER_BIZ_CITY: [CallbackQueryHandler(merchant_biz_city, pattern="^bizcity_")],
+            MER_BIZ_CITY: [
+                CallbackQueryHandler(merchant_biz_city_other_prompt, pattern="^bizcity_other$"),
+                CallbackQueryHandler(merchant_biz_city, pattern=r"^bizcity_\d+$"),
+            ],
+            MER_BIZ_CITY_OTHER: [
+                MessageHandler(filters.Regex(r"^(↩️ رجوع|🏠 القائمة الرئيسية)$"), navigation_text_router),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, merchant_biz_city_other_received),
+            ],
             MER_BIZ_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, merchant_biz_phone)],
             MER_MENU: [
                 CallbackQueryHandler(merchant_menu_router, pattern=r"^(new_campaign|redeem_menu|my_campaigns|business_status)$"),
@@ -1272,6 +1347,9 @@ def build_application() -> Application:
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
     )
+    application.add_handler(MessageHandler(
+        filters.Regex(r"^(↩️ رجوع|🏠 القائمة الرئيسية)$"), navigation_text_router
+    ), group=-1)
     application.add_handler(conv)
 
     # أوامر الإدارة (خارج المحادثة الرئيسية)
